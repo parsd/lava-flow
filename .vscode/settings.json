@@ -1,0 +1,14 @@
+{
+    "spellright.language": [
+        "en"
+    ],
+    "spellright.documentTypes": [
+        "markdown",
+        "latex",
+        "plaintext",
+        "reStructuredText"
+    ],
+    "editor.rulers": [
+        120
+    ]
+}
