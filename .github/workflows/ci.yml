@@ -33,14 +33,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy annotations
-        uses: reviewdog/action-rust@v1
+        uses: actions-rs/clippy-check@v1
         with:
-          tool: clippy
-          reporter: github-check
-          clippy_flags: "--workspace --all-features"
-          fail_on_error: true
-        env:
-          REVIEWDOG_GITHUB_API_TOKEN: ${{ github.token }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          args: --workspace --all-features -- -D warnings
 
       - name: Tests
         run: cargo test --workspace --all-features
