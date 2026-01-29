@@ -91,7 +91,7 @@ jobs:
           }
           pathlib.Path("public/coverage.json").write_text(json.dumps(badge), encoding="utf-8")
           pathlib.Path("public/index.html").write_text(
-              "<!doctype html>
+              """<!doctype html>
           <html lang='en'>
           <head><meta charset='utf-8'><title>lava-flow reports</title></head>
           <body>
@@ -101,7 +101,7 @@ jobs:
               <li><a href='coverage/'>Coverage report</a></li>
             </ul>
           </body>
-          </html>",
+          </html>""",
               encoding="utf-8",
           )
           PY
