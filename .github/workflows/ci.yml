@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
+  issues: write
   pages: write
   id-token: write
 
@@ -25,12 +27,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
 
       - name: Format
         run: cargo fmt --all -- --check
 
-      - name: Clippy (warnings as errors)
-        run: cargo clippy --workspace --all-features -- -D warnings
+      - name: Clippy annotations
+        uses: reviewdog/action-rust@v1
+        with:
+          tool: clippy
+          reporter: github-check
+          clippy_flags: "--workspace --all-features"
+          fail_on_error: true
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ github.token }}
 
       - name: Tests
         run: cargo test --workspace --all-features
@@ -43,6 +53,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov
@@ -66,27 +77,11 @@ jobs:
           <html lang="en">
           <head>
             <meta charset="utf-8">
+            <meta http-equiv="refresh" content="0; url=lava_flow/">
             <title>lava-flow docs</title>
-            <link rel="stylesheet" href="lava_flow/static.files/rustdoc.css">
-            <script defer src="lava_flow/static.files/storage.js"></script>
-            <script defer src="lava_flow/static.files/main.js"></script>
           </head>
-          <body class="rustdoc-page">
-            <nav id="nav" class="sidebar">
-              <div class="sidebar-crate">
-                <h2>lava-flow docs</h2>
-                <div class="theme-picker">
-                  <button id="theme-toggle" type="button" title="Toggle theme">Theme</button>
-                </div>
-              </div>
-            </nav>
-            <main>
-              <h1 class="title">lava-flow docs</h1>
-              <p class="subtitle">API documentation and reference.</p>
-              <ul class="block">
-                <li><a href="lava_flow/">lava-flow crate docs</a></li>
-              </ul>
-            </main>
+          <body>
+            <p>Redirecting to <a href="lava_flow/">lava-flow docs</a>...</p>
           </body>
           </html>
           HTML
@@ -135,6 +130,20 @@ jobs:
           )
           PY
 
+      - name: Extract coverage percent
+        id: coverage
+        run: |
+          python - <<'PY' >> $GITHUB_OUTPUT
+          import json, pathlib
+          data = json.loads(pathlib.Path("target/llvm-cov/coverage.json").read_text(encoding="utf-8"))
+          percent = 0.0
+          try:
+              percent = data["data"][0]["totals"]["lines"].get("percent", 0.0)
+          except Exception:
+              percent = 0.0
+          print(f"percent={percent:.2f}")
+          PY
+
       - name: Upload coverage HTML (artifact)
         uses: actions/upload-artifact@v4
         with:
@@ -145,6 +154,73 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: public
+
+      - name: Comment coverage on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const percent = '${{ steps.coverage.outputs.percent }}';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const { data: artifacts } = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId
+            });
+            const coverageArtifact = artifacts.artifacts.find(a => a.name === 'coverage-html');
+            const artifactUrl = coverageArtifact ? coverageArtifact.archive_download_url : runUrl;
+            const pagesUrl = `https://${context.repo.owner}.github.io/${context.repo.repo}/coverage/`;
+            let mainPercent = null;
+            try {
+              const resp = await fetch(`https://${context.repo.owner}.github.io/${context.repo.repo}/coverage.json`, { cache: 'no-store' });
+              if (resp.ok) {
+                const data = await resp.json();
+                const msg = (data && data.message) ? data.message : '';
+                mainPercent = parseFloat(String(msg).replace('%',''));
+              }
+            } catch (e) {
+              mainPercent = null;
+            }
+
+            let deltaLine = '- Main coverage (Pages): unavailable';
+            if (typeof mainPercent === 'number' && !Number.isNaN(mainPercent)) {
+              const pr = parseFloat(percent);
+              const delta = (pr - mainPercent);
+              const color = delta >= 0 ? '🟢' : '🔴';
+              const sign = delta >= 0 ? '+' : '';
+              deltaLine = `- Main coverage (Pages): **${mainPercent.toFixed(2)}%** (${color} ${sign}${delta.toFixed(2)}%)`;
+            }
+
+            const body = [
+              'Coverage report for this PR:',
+              `- Line coverage: **${percent}%**`,
+              deltaLine,
+              `- HTML report artifact (download): ${artifactUrl}`,
+              `- Pages (main branch only): ${pagesUrl}`,
+              `- Workflow run: ${runUrl}`
+            ].join('\\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            const existing = comments.find(c => c.user?.type === 'Bot' && c.body?.startsWith('Coverage report for this PR:'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
 
   deploy_pages:
     runs-on: ubuntu-latest
@@ -157,3 +233,5 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+
