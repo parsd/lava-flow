@@ -1,4 +1,7 @@
-﻿# lava-flow
+# lava-flow
+
+[![Coverage](https://img.shields.io/endpoint?url=https://parsd.github.io/lava-flow/coverage.json)](https://parsd.github.io/lava-flow/coverage/)
+[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://parsd.github.io/lava-flow/docs/)
 
 **A Rust GPU and CPU communication library providing zero-copy data movement between processes with transparent routing**
 **to optimal transports.**
@@ -27,13 +30,15 @@ Supports GPU-only clusters, CPU-only HPC, mixed systems, and edge devices with *
 ### Start Here
 
 - **[Documentation Index](doc/README.md)** - Map of specs, ADRs, and plans
-- **[Architecture](doc/spec/architecture.md)** — System design with two-layer model
+- **[Architecture](doc/spec/architecture.md)** � System design with two-layer model
+- **[GitHub Pages Docs](https://parsd.github.io/lava-flow/docs/)** � Published API docs
+- **[Coverage Report](https://parsd.github.io/lava-flow/coverage/)** � Coverage on main branch
 
 ### Planning & Design
 
-- **[Design Rationale](doc/plan/design_rationale.md)** — What and why; linking the ADRs
-- **[Architecture Decision Records](doc/adr/README.md)** — Detail information on architectural decisions
-- **[Implementation Plan](doc/plan/README.md)** — Multi-phase implementation roadmap
+- **[Design Rationale](doc/plan/design_rationale.md)** � What and why; linking the ADRs
+- **[Architecture Decision Records](doc/adr/README.md)** � Detail information on architectural decisions
+- **[Implementation Plan](doc/plan/README.md)** � Multi-phase implementation roadmap
 
 ## Key Concepts
 
@@ -72,7 +77,7 @@ See [Platform Support](doc/platform_support.md) for the full matrix and notes.
 
 ## License
 
-MIT License — See [LICENSE](LICENSE) file for details.
+MIT License � See [LICENSE](LICENSE) file for details.
 
 ## Quick Links
 

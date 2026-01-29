@@ -421,6 +421,13 @@ tests/
 
 ## Test Execution Guide
 
+### One-Time Setup
+
+```bash
+# Install coverage tool
+cargo install cargo-llvm-cov
+```
+
 ### Local Development
 
 ```bash
@@ -435,6 +442,13 @@ cargo test --test integration
 
 # Benchmarks (best-effort, local only)
 cargo bench
+
+# Coverage (workspace)
+cargo llvm-cov --workspace --all-features
+
+# Coverage HTML report
+cargo llvm-cov --workspace --all-features --html
+# open: target/llvm-cov/html/index.html
 ```
 
 ### Before Commit
