@@ -61,6 +61,35 @@ jobs:
           mkdir -p public/coverage public/docs
           cp -r target/llvm-cov/html/* public/coverage/
           cp -r target/doc/* public/docs/
+          cat > public/docs/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <title>lava-flow docs</title>
+            <link rel="stylesheet" href="lava_flow/static.files/rustdoc.css">
+            <script defer src="lava_flow/static.files/storage.js"></script>
+            <script defer src="lava_flow/static.files/main.js"></script>
+          </head>
+          <body class="rustdoc-page">
+            <nav id="nav" class="sidebar">
+              <div class="sidebar-crate">
+                <h2>lava-flow docs</h2>
+                <div class="theme-picker">
+                  <button id="theme-toggle" type="button" title="Toggle theme">Theme</button>
+                </div>
+              </div>
+            </nav>
+            <main>
+              <h1 class="title">lava-flow docs</h1>
+              <p class="subtitle">API documentation and reference.</p>
+              <ul class="block">
+                <li><a href="lava_flow/">lava-flow crate docs</a></li>
+              </ul>
+            </main>
+          </body>
+          </html>
+          HTML
           python - <<'PY'
           import json, pathlib
           data = json.loads(pathlib.Path("target/llvm-cov/coverage.json").read_text(encoding="utf-8"))
