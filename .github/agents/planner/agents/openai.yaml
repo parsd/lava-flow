@@ -1,0 +1,3 @@
+display_name: Planner
+short_description: Research and produce implementation plans with focused Mermaid diagrams.
+default_prompt: Use the planner skill to research and create a documentation-only implementation plan.

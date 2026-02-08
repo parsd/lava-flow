@@ -1,0 +1,3 @@
+display_name: Security Reviewer
+short_description: Review security anti-patterns, dependency CVEs, and interop safety.
+default_prompt: Use the security-reviewer skill to perform a security-focused review with actionable fixes.
