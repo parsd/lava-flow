@@ -11,14 +11,20 @@ same allocation without copying. The detailed requirements and edge cases live i
 
 **Architecture:**
 
-```text
-lava-flow (Vulkan allocation)
-         |
-    External Handle (fd/HANDLE)
-         |
-    +-----------+---------+--------+
-    |           |         |        |
-  CUDA       OpenCL    OpenGL   (future: Metal, etc.)
+```mermaid
+flowchart TD
+  LF["lava flow (Vulkan allocation)"]
+  EH["External Handle (fd or HANDLE)"]
+  CUDA[CUDA]
+  OCL[OpenCL]
+  OGL[OpenGL]
+  FUTURE[Future APIs Metal and others]
+
+  LF --> EH
+  EH --> CUDA
+  EH --> OCL
+  EH --> OGL
+  EH --> FUTURE
 ```
 
 ---

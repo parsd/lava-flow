@@ -12,6 +12,7 @@ description: Research and plan implementation work using repository evidence and
 3. Use web sources only when recency or external dependencies require it.
 4. Produce an implementation plan with ordered, testable steps.
 5. Update planning documentation only (for example under `doc/plan/`), never production code.
+6. When documentation contains ASCII graphics, replace them with Mermaid diagrams that preserve the original meaning.
 
 ## Guardrails
 
@@ -25,6 +26,7 @@ description: Research and plan implementation work using repository evidence and
 - Include Mermaid diagrams as needed:
   - One topic per diagram.
   - Use implementation identifiers from the codebase.
+  - Prefer Mermaid over ASCII graphics; convert ASCII diagrams to Mermaid during documentation edits.
   - Use relationship/dependency diagrams when structure matters.
   - Use sequence diagrams when behavior over time matters.
 - Keep diagrams concise and directly actionable.

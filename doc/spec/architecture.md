@@ -8,44 +8,29 @@ traffic through MPI.
 
 ## Two-Layer Architecture
 
-```text
-┌─────────────────────────────────────────────────────────────┐
-│ Layer 2: Channel Transports                                 │
-│                                                             │
-│  Same Host                    Different Host                │
-│  ┌────────────────────┐      ┌────────────────────┐         │
-│  │ Vulkan IPC         │      │ MPI Messaging      │         │
-│  │ < 100 ns latency   │      │ ~10 us latency     │         │
-│  │ GPU <-> GPU direct │      │ Process <-> Process│         │
-│  └────────────────────┘      └────────────────────┘         │
-│           ↑                            ↑                    │
-│           └────────────┬───────────────┘                    │
-│                        │ Scope Detection                    │
-│                        │ (Compare hostnames)                │
-│                        ↓                                    │
-├─────────────────────────────────────────────────────────────┤
-│ Layer 1: Memory & Allocator (Phase 2)                       │
-│                                                             │
-│  GPU Memory (Vulkan)          CPU Memory (Host)             │
-│  ┌──────────────────────┐     ┌──────────────────────┐      │
-│  │ DEVICE_LOCAL         │     │ Standard (malloc)    │      │
-│  │ 100-900 GB/s         │     │ 50-100 GB/s          │      │
-│  │                      │     │                      │      │
-│  │ HOST_VISIBLE         │     │ NUMA-aware           │      │
-│  │ 10-50 GB/s (PCIe)    │     │ 10-100 GB/s          │      │
-│  │                      │     │                      │      │
-│  │ External export      │     │ Hugepages            │      │
-│  │ (fd/HANDLE)          │     │ 50-100 GB/s          │      │
-│  │                      │     │                      │      │
-│  │                      │     │ GPU-pinned           │      │
-│  │                      │     │ PCIe bandwidth       │      │
-│  └──────────────────────┘     └──────────────────────┘      │
-│                  ↑                         ↑                │
-│                  └────────────┬────────────┘                │
-│                               │ Unified API                 │
-│                               ↓                             │
-│                      MemoryAllocator                        │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+  MA[MemoryAllocator]
+  SD[Scope Detection compare hostnames]
+
+  subgraph "Layer 1: Memory and Allocator"
+    direction LR
+    GPU[GPU Memory Vulkan]
+    CPU[CPU Memory Host Standard]
+  end
+
+  subgraph "Layer 2: Channel Transports"
+    direction LR
+    VI[Vulkan IPC]
+    MPI[MPI Messaging]
+  end
+
+  MA --> GPU
+  MA --> CPU
+  GPU --> SD
+  CPU --> SD
+  SD --> VI
+  SD --> MPI
 ```
 
 Note: local CPU channels use OS shared memory, while local GPU channels use Vulkan IPC.
@@ -210,20 +195,24 @@ pub fn detect_scope(
 
 ### Data Flow
 
-```text
-Input:  ProcessLocation { hostname, node_id, device_id }
-        ProcessLocation { hostname, node_id, device_id }
-              ↓
-       Compare hostnames
-              ↓
-    ┌─────────┴─────────┐
-    ↓                   ↓
-  Same?             Different?
-    ↓                   ↓
-  Local               Remote
-    ↓                   ↓
-Vulkan IPC/        MPI Transport
-CPU shared memory
+```mermaid
+flowchart TD
+  A[ProcessLocation my_location hostname node_id device_id]
+  B[ProcessLocation peer_location hostname node_id device_id]
+  C[Compare hostnames]
+  D{Same hostname}
+  E[CommunicationScope Local]
+  F[CommunicationScope Remote]
+  G[Vulkan IPC or CPU shared memory]
+  H[MPI transport]
+
+  A --> C
+  B --> C
+  C --> D
+  D -->|yes| E
+  D -->|no| F
+  E --> G
+  F --> H
 ```
 
 ### Usage
