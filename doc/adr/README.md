@@ -24,3 +24,5 @@ When to references ADRs:
 | [009](009-no-global-state.md) | No Global State (Design Principle) | Accepted | Architecture |
 | [010](010-channel-buffer-strategy.md) | Channel Buffer Strategy | Accepted | Channel buffering |
 | [011](011-multi-language-bindings.md) | Multi-Language Bindings (Orthogonal) | Accepted | Language support |
+| [012](012-serde-serialization.md) | Serde for Data Serialization | Accepted | Type serialization |
+| [013](013-hostname-library.md) | Hostname Library for Host Identity | Accepted | Scope detection reliability |

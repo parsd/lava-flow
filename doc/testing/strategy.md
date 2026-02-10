@@ -477,10 +477,14 @@ cargo bench --bench '*'
 
 | Layer | Unit | Integration | E2E | Coverage |
 | ----- | ---- | ----------- | --- | -------- |
-| **Layer 1 (Memory)** | 90%+ | 80%+ | N/A | High |
-| **Layer 2 (Channels)** | 85%+ | 75%+ | 60%+ | Medium |
+| **Layer 1 (Memory)** | 95%+ | 95%+ | N/A | High |
+| **Layer 2 (Channels)** | 95%+ | 95%+ | 60%+ | Medium |
 | **Error handling** | 100% | 100% | 100% | Critical |
 | **Scope detection** | 100% | 100% | 100% | Critical |
+
+Coverage policy note:
+Prefer 100% line/function coverage for core modules. Region coverage is useful for trend tracking but may be lower due
+to LLVM coverage region granularity and should not be treated as a strict blocker by itself.
 
 ---
 

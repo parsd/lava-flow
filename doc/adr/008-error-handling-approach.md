@@ -10,6 +10,7 @@ to 5 lines per error type.
 ## Decision
 
 **Use `thiserror` for public error types.**
+Prefer typed, shared reason enums for repeated validation/error categories instead of ad-hoc local string constants.
 
 ## Rationale
 

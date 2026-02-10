@@ -10,11 +10,27 @@ These instructions apply to coding agents when modifying this repository.
 
 If any step cannot be run, explain why and what would be required to run it.
 
+## Cargo Execution
+
+- Run `cargo` commands outside the sandbox.
+- `cargo clean` may be used to clean build targets when needed.
+
 ## Design Consistency
 
 - Follow the specs under `doc/spec/` and decisions in `doc/adr/`.
 - If a change conflicts with a spec/ADR, update the document and highlight that adjustment in your output
   or call out the mismatch.
+- For reusable validation/error reasons, prefer shared enums over local string constants.
+
+## Documentation Standards
+
+- Write rustdoc-compatible documentation for all `pub` types and functions.
+- For non-public code, document important or complex implementation details where intent is not obvious.
+
+## Coverage Standards
+
+- Strive for 100% line and function coverage for core logic.
+- Region coverage may be lower due to compiler/instrumentation granularity; treat it as a guidance metric, not a hard gate.
 
 ## Skills
 

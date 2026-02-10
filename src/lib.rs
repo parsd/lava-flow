@@ -1,7 +1,4 @@
-#[cfg(test)]
-mod tests {
-    // use super::*;
+pub mod error;
+pub mod types;
 
-    #[test]
-    fn it_works() {}
-}
+pub use error::{LavaFlowError, Result, ValidationReason};

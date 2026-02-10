@@ -20,11 +20,15 @@ Define the core types, errors, and scope detection logic. No GPU APIs or transpo
 
 ```rust
 use lava_flow::types::{ProcessLocation, CommunicationScope};
+use lava_flow::Result;
 
-let my_loc = ProcessLocation::new("gpu-node-0");
-let peer_loc = ProcessLocation::new("gpu-node-1");
+fn main() -> Result<()> {
+let my_loc = ProcessLocation::new("gpu-node-0")?;
+let peer_loc = ProcessLocation::new("gpu-node-1")?;
 let scope = CommunicationScope::from_locations(&my_loc, &peer_loc);
 assert_eq!(scope, CommunicationScope::Remote);
+Ok(())
+}
 ```
 
 ## Related Docs
