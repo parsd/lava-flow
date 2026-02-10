@@ -32,6 +32,11 @@ If any step cannot be run, explain why and what would be required to run it.
 - Strive for 100% line and function coverage for core logic.
 - Region coverage may be lower due to compiler/instrumentation granularity; treat it as a guidance metric, not a hard gate.
 
+## License Policy
+
+- Do not introduce copyleft licenses (for example GPL) into this library or its dependencies.
+- LGPL may be accepted only when there is a strong justification, but it should be avoided by default.
+
 ## Skills
 
 A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of

@@ -2,14 +2,16 @@
 
 ## TL;DR
 
-Implement Layer 1: a unified allocator for Vulkan GPU memory and multiple CPU strategies, with automatic selection.
+Implement Layer 1: a unified allocator for Vulkan GPU memory and core CPU strategies, with automatic selection.
+NUMA support is deferred from the first implementation and treated as optional future work.
 
 ## Scope
 
 - Vulkan GPU memory allocation and external export
-- CPU allocation strategies: standard, NUMA, hugepages, GPU-pinned
+- CPU allocation strategies (first implementation): standard, hugepages, GPU-pinned
 - A single `MemoryAllocator` that picks strategies based on scope and profile
 - A unified external handle type that hides fd vs Win32 HANDLE
+- Optional future extension: NUMA-aware CPU allocation
 
 ## Deliverables
 
@@ -17,6 +19,7 @@ Implement Layer 1: a unified allocator for Vulkan GPU memory and multiple CPU st
 - External memory export (fd/HANDLE wrapped in a single handle type)
 - Strategy selection logic
 - Integration tests for allocation and export/import
+- Documented extension point for optional future NUMA backend
 
 ## Example (API Shape)
 
@@ -47,3 +50,10 @@ let handle: ExternalMemoryHandle = buffer.export_handle()?;
 - [Vulkan External Memory (fd)](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_KHR_external_memory_fd.html)
 - [Vulkan External Memory (win32)](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_KHR_external_memory_win32.html)
 - [libnuma](https://github.com/numactl/numactl)
+
+## Deferred (Optional Future)
+
+- NUMA support (`libnuma`/`numactl`) is not part of the first Phase 2 implementation.
+- If introduced later, it should be feature-gated and added without breaking the initial allocator API.
+- License note: `numactl` is GPL and `libnuma` is LGPL; this conflicts with the preferred dependency policy for the
+  initial implementation.

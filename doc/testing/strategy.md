@@ -62,9 +62,9 @@ fn test_scope_detection_different_host() {
 
 - GPU memory export/import (Vulkan IPC)
 - Channel creation and basic send/recv
-- NUMA allocation correctness
 - Hugepage allocation on Linux
 - CPU memory sharing between processes
+- Optional future: NUMA allocation correctness (when NUMA backend is implemented)
 
 **Location:** `tests/integration/`
 
@@ -406,8 +406,8 @@ tests/
 +-- integration/                    # Tier 2: Integration tests
 |   +-- test_gpu_ipc.rs
 |   +-- test_channel_basic.rs
-|   +-- test_numa_allocation.rs
 |   +-- test_cpu_shared_memory.rs
+|   +-- test_numa_allocation.rs        # optional future (NUMA backend)
 |
 +-- e2e/                            # Tier 3: End-to-End Tests
 |   +-- test_mpi_communication.rs

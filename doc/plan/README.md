@@ -32,6 +32,15 @@ Detailed phase specs live in the following files:
 
 For decision rationale, see [ADRs](../adr/README.md).
 
+## License Compatibility Notes
+
+- Project policy: do not introduce GPL-licensed components. LGPL may be possible with strong justification, but should
+  be avoided by default.
+- Phase 2 implication: `libnuma`/`numactl` are deferred from first implementation partly due to license policy
+  constraints (`numactl` GPL, `libnuma` LGPL).
+- MPL-2.0 tools used for development workflows (for example `cbindgen` in Phase 6) are generally acceptable under the
+  current policy.
+
 ## Risk Assessment
 
 ### High Risk (Must Address Before MVP)
