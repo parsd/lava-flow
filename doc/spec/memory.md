@@ -45,7 +45,7 @@ pub enum MemoryLocation {
 Benefits:
 
 - Producer doesn't need to know memory type
-- Scope detection can select appropriate memory automatically
+- Caller can choose memory location explicitly and use allocator fallback behavior when needed
 - Channels work over GPU buffers or CPU buffers identically
 - Future: heterogeneous compute (CPU -> GPU transfers)
 
@@ -402,47 +402,29 @@ let cpu_buffer = allocator.allocate(
 
 ---
 
-## Memory Type Detection
+## Memory Location Selection
 
-### Scope Detection Extended
-
-Current scope detection (Phase 1) only determines transport. Layer 1 adds memory type selection:
+Layer 1 now uses explicit location requests from the caller:
 
 ```rust
-pub fn select_memory_location(
-    scope: CommunicationScope,
-    channel_profile: ChannelProfile,
-) -> MemoryLocation {
-    match (scope, channel_profile) {
-        (CommunicationScope::Local, ChannelProfile::GpuPreferred) => {
-            // GPU memory: full bandwidth
-            MemoryLocation::GpuVulkan { device_id: 0 }
-        }
-        (CommunicationScope::Local, ChannelProfile::CpuShared) => {
-            // CPU memory: shared memory on same host
-            MemoryLocation::CpuHost {
-                numa_node: None,
-                gpu_pinned: false,
-                use_hugepages: false,
-            }
-        }
-        (CommunicationScope::Remote, ChannelProfile::GpuPreferred)
-        | (CommunicationScope::Remote, ChannelProfile::CpuShared) => {
-            // CPU memory for remote communication
-            MemoryLocation::CpuHost {
-                numa_node: None,
-                gpu_pinned: false,
-                use_hugepages: false,
-            }
-        }
-    }
-}
-
-pub enum ChannelProfile {
-    GpuPreferred,    // GPU buffers (local only)
-    CpuShared,       // CPU shared memory
-}
+let gpu = allocator.allocate(size, MemoryLocation::GpuVulkan { device_id: 0 })?;
+let cpu = allocator.allocate(size, MemoryLocation::CpuHost { gpu_pinned: false })?;
 ```
+
+For resilient behavior, callers can use deterministic fallback:
+
+```rust
+let buffer = allocator.allocate_with_fallback(
+    size,
+    MemoryLocation::GpuVulkan { device_id: 0 },
+)?;
+```
+
+Fallback behavior:
+
+- `GpuVulkan` -> `CpuHost { gpu_pinned: false }`
+- `CpuHost { gpu_pinned: true }` -> `CpuHost { gpu_pinned: false }`
+- `CpuHost { gpu_pinned: false }` -> no fallback
 
 ---
 
@@ -692,6 +674,6 @@ fn test_allocation_fallback() {
 
 3. **Unified API**
    - Single `MemoryAllocator` interface
-   - Automatic location selection based on scope
+   - Explicit location request with deterministic fallback
    - Fallback strategies
    - Error handling

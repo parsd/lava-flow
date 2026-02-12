@@ -24,6 +24,14 @@ pub enum ValidationReason {
     InvalidCharacters,
 }
 
+/// Shared reasons for allocation request failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AllocationReason {
+    /// The requested size was zero.
+    #[error("allocation size must be greater than zero")]
+    ZeroSize,
+}
+
 /// Top-level error type for lava-flow core APIs.
 #[derive(Debug, Error)]
 pub enum LavaFlowError {
@@ -57,6 +65,33 @@ pub enum LavaFlowError {
     /// Hostname detection via OS APIs failed.
     #[error("failed to detect local hostname")]
     HostnameDetection(#[source] std::io::Error),
+
+    /// Memory allocation request failed validation.
+    #[error("invalid allocation request (size={size}): {reason}")]
+    InvalidAllocationRequest {
+        /// Requested allocation size in bytes.
+        size: usize,
+        /// Structured reason for rejection.
+        reason: AllocationReason,
+    },
+
+    /// A requested GPU device id is not known by the allocator.
+    #[error("GPU device `{device_id}` not found")]
+    GpuDeviceNotFound {
+        /// Requested device id.
+        device_id: u32,
+    },
+
+    /// GPU allocation was requested but no GPU backend is available.
+    #[error("GPU backend is not available")]
+    GpuBackendUnavailable,
+
+    /// Internal allocator state lock was poisoned by a prior panic.
+    #[error("allocator state lock poisoned: {component}")]
+    AllocatorStatePoisoned {
+        /// Internal component that failed lock acquisition.
+        component: &'static str,
+    },
 }
 
 /// Standard result type for lava-flow APIs.

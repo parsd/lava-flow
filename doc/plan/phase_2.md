@@ -2,14 +2,14 @@
 
 ## TL;DR
 
-Implement Layer 1: a unified allocator for Vulkan GPU memory and core CPU strategies, with automatic selection.
+Implement Layer 1: a unified allocator for Vulkan GPU memory and core CPU strategies, with explicit location requests.
 NUMA support is deferred from the first implementation and treated as optional future work.
 
 ## Scope
 
 - Vulkan GPU memory allocation and external export
 - CPU allocation strategies (first implementation): standard, GPU-pinned
-- A single `MemoryAllocator` that picks strategies based on scope and profile
+- A single `MemoryAllocator` with explicit `MemoryLocation` requests and deterministic fallback
 - A unified interprocess handle type for GPU external memory and CPU shared memory
 - Parallel allocation support via thread-safe internal mutability in allocator backends
 - Optional future extension: NUMA-aware CPU allocation
@@ -18,7 +18,7 @@ NUMA support is deferred from the first implementation and treated as optional f
 
 - `MemoryAllocator` with GPU + CPU backends
 - Interprocess handle export (GPU external + CPU shared-memory handle variants)
-- Strategy selection logic
+- Deterministic fallback logic
 - Integration tests for allocation and export/import
 - Documented extension point for optional future NUMA backend
 
