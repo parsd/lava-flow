@@ -86,12 +86,6 @@ pub trait MemoryAllocator {
     // Explicit allocation with location hint
     fn allocate(&mut self, size: usize, location: MemoryLocation)
         -> Result<Box<dyn MemoryBuffer>, Error>;
-
-    // Automatic based on scope detection
-    fn allocate_auto(&mut self, size: usize,
-                     my_location: &ProcessLocation,
-                     peer_location: &ProcessLocation)
-        -> Result<Box<dyn MemoryBuffer>, Error>;
 }
 ```
 

@@ -7,6 +7,7 @@
 Use `VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT` (file descriptors) on Linux and
 `VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT` (`HANDLE` objects) on Windows for Vulkan external memory sharing.
 DMA-BUF support deferred to Phase 5+ as optional optimization.
+Expose these as GPU variants inside a unified interprocess handle enum that also carries CPU shared-memory handles.
 
 ## Problem
 
@@ -85,12 +86,16 @@ pub const EXTERNAL_MEMORY_HANDLE_TYPE: vk::ExternalMemoryHandleTypeFlags =
 pub const EXTERNAL_MEMORY_HANDLE_TYPE: vk::ExternalMemoryHandleTypeFlags =
     vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32;
 
-pub struct ExternalMemoryHandle {
+pub enum InterprocessMemoryHandle {
     #[cfg(target_os = "linux")]
-    pub fd: RawFd,
+    GpuOpaqueFd(RawFd),
+    #[cfg(target_os = "linux")]
+    CpuSharedFd(RawFd),
 
     #[cfg(target_os = "windows")]
-    pub handle: HANDLE,
+    GpuOpaqueWin32Handle(HANDLE),
+    #[cfg(target_os = "windows")]
+    CpuSharedWin32Handle(HANDLE),
 }
 ```
 
@@ -98,4 +103,5 @@ pub struct ExternalMemoryHandle {
 
 - **Maximum compatibility** — Works on all major drivers
 - **Cross-API import** — CUDA/OpenCL can import
+- **Unified API surface** — GPU and CPU shared-memory transports can use one handle type
 - **Not GPU-aware** — DMA-BUF potentially faster (future optimization)

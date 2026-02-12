@@ -8,15 +8,16 @@ NUMA support is deferred from the first implementation and treated as optional f
 ## Scope
 
 - Vulkan GPU memory allocation and external export
-- CPU allocation strategies (first implementation): standard, hugepages, GPU-pinned
+- CPU allocation strategies (first implementation): standard, GPU-pinned
 - A single `MemoryAllocator` that picks strategies based on scope and profile
-- A unified external handle type that hides fd vs Win32 HANDLE
+- A unified interprocess handle type for GPU external memory and CPU shared memory
+- Parallel allocation support via thread-safe internal mutability in allocator backends
 - Optional future extension: NUMA-aware CPU allocation
 
 ## Deliverables
 
 - `MemoryAllocator` with GPU + CPU backends
-- External memory export (fd/HANDLE wrapped in a single handle type)
+- Interprocess handle export (GPU external + CPU shared-memory handle variants)
 - Strategy selection logic
 - Integration tests for allocation and export/import
 - Documented extension point for optional future NUMA backend
@@ -24,15 +25,15 @@ NUMA support is deferred from the first implementation and treated as optional f
 ## Example (API Shape)
 
 ```rust
-use lava_flow::{MemoryAllocator, MemoryLocation, ExternalMemoryHandle};
+use lava_flow::{InterprocessMemoryHandle, MemoryAllocator, MemoryLocation};
 
-let mut allocator = MemoryAllocator::new()?;
+let allocator = MemoryAllocator::new();
 let buffer = allocator.allocate(
     1_000_000,
     MemoryLocation::GpuVulkan { device_id: 0 }
 )?;
 
-let handle: ExternalMemoryHandle = buffer.export_handle()?;
+let handle: InterprocessMemoryHandle = buffer.export_handle()?;
 ```
 
 ## Related Docs

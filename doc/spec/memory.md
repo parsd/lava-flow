@@ -1,4 +1,4 @@
-﻿# Layer 1: Memory & Allocator Architecture
+# Layer 1: Memory & Allocator Architecture
 
 This document specifies the complete memory allocation layer for lava-flow, supporting both GPU and CPU memory.
 
@@ -12,18 +12,33 @@ This document specifies the complete memory allocation layer for lava-flow, supp
 
 Channels ([Layer 2](channels.md)) operate over both GPU and CPU memory transparently.
 
+## Current Phase-2 Status
+
+The current implementation intentionally keeps the first CPU backend minimal:
+
+- CPU strategies implemented: `Standard`, `GpuPinned`
+- NUMA and hugepages are deferred
+- `MemoryAllocator::new()` is infallible; GPU backend is optional at runtime
+- `MemoryAllocator` allocation methods use `&self`; backend mutability is guarded internally
+  with synchronization primitives so parallel allocation is supported safely
+- Sender-side code should allocate explicitly via `allocate(...)`; receive-side allocation policy is defined by
+  channel receive APIs (`recv_alloc` / `recv_into`)
+- `MemoryBuffer::export_handle()` returns a unified `InterprocessMemoryHandle` for:
+  - GPU external memory handles
+  - CPU shared-memory transport handles
+
 ## Design Principle
 
 **Single allocation interface, multiple backing stores:**
 
 ```rust
 pub trait MemoryAllocator {
-    fn allocate(&mut self, size: usize, location: MemoryLocation) -> Result<MemoryBuffer, Error>;
+    fn allocate(&self, size: usize, location: MemoryLocation) -> Result<MemoryBuffer, Error>;
 }
 
 pub enum MemoryLocation {
     GpuVulkan { device: u32 },          // GPU memory via Vulkan
-    CpuHost { numa_node: Option<u32> }, // CPU host memory (aligned, NUMA-aware)
+    CpuHost { gpu_pinned: bool },   // CPU host memory
 }
 ```
 
@@ -48,14 +63,18 @@ pub struct GpuMemoryBuffer {
     pub size: usize,
 
     // External memory export capability
-    pub external_handle: Option<ExternalMemoryHandle>,
+    pub external_handle: Option<InterprocessMemoryHandle>,
 }
 
-pub enum ExternalMemoryHandle {
+pub enum InterprocessMemoryHandle {
     #[cfg(target_os = "linux")]
-    Fd(std::os::unix::io::RawFd),
+    GpuOpaqueFd(std::os::unix::io::RawFd),
+    #[cfg(target_os = "linux")]
+    CpuSharedFd(std::os::unix::io::RawFd),
     #[cfg(target_os = "windows")]
-    Win32Handle(HANDLE),
+    GpuOpaqueWin32Handle(HANDLE),
+    #[cfg(target_os = "windows")]
+    CpuSharedWin32Handle(HANDLE),
     // DmaBufFd(i32),         // Future Linux: DMA-BUF file descriptor (preferred)
 }
 ```
@@ -120,7 +139,7 @@ cl_mem opencl_buffer = clCreateBufferFromExternalMemory(...);
 - **Latency:** O(1) allocation (no copies)
 - **Throughput:** Full GPU bandwidth (100+ GB/s)
 - **Scope:** Vulkan device to any process on same machine
-- **Exportable:** Yes, via `ExternalMemoryHandle`
+- **Exportable:** Yes, via `InterprocessMemoryHandle`
 - **Cross-API:** Yes (CUDA, OpenCL, OpenGL via standard extensions)
 
 ---
@@ -140,7 +159,7 @@ pub struct CpuMemoryBuffer {
     pub is_hugepage: bool,
 
     // Interop with GPU
-    pub gpu_accessible: bool,  // Can GPU map this?
+    pub gpu_pinned: bool,  // Can GPU map this?
     pub pinned: bool,          // Is memory pinned (locked)?
 }
 ```
@@ -160,7 +179,7 @@ pub fn allocate_cpu_standard(size: usize) -> Result<CpuMemoryBuffer> {
         alignment: 64,
         numa_node: None,
         is_hugepage: false,
-        gpu_accessible: false,
+        gpu_pinned: false,
         pinned: false,
     })
 }
@@ -187,7 +206,7 @@ pub fn allocate_cpu_numa(size: usize, numa_node: u32) -> Result<CpuMemoryBuffer>
         alignment: 4096,
         numa_node: Some(numa_node),
         is_hugepage: false,
-        gpu_accessible: false,
+        gpu_pinned: false,
         pinned: false,
     })
 }
@@ -217,7 +236,7 @@ pub fn allocate_cpu_gpu_pinned(size: usize) -> Result<CpuMemoryBuffer> {
         alignment: 4096,
         numa_node: None,
         is_hugepage: false,
-        gpu_accessible: true,
+        gpu_pinned: true,
         pinned: true,
     })
 }
@@ -232,7 +251,7 @@ pointer. The closest options are allocating `HOST_VISIBLE` Vulkan memory and map
 - Latency: O(1) allocation, PCIe latency for GPU access
 - Alignment: Page-aligned (4KB)
 - Accessible from: CPU (cache-coherent), GPU (slower than DEVICE_LOCAL)
-- Use case: CPU ↔ GPU staging buffer
+- Use case: CPU ? GPU staging buffer
 
 #### 4. **Huge Pages**
 
@@ -250,7 +269,7 @@ pub fn allocate_cpu_hugepage(size: usize, numa_node: Option<u32>) -> Result<CpuM
         alignment: 2 * 1024 * 1024,  // 2MB pages
         numa_node,
         is_hugepage: true,
-        gpu_accessible: false,
+        gpu_pinned: false,
         pinned: false,
     })
 }
@@ -288,7 +307,7 @@ pub enum MemoryLocation {
     GpuVulkan { device_id: u32 },
     CpuHost {
         numa_node: Option<u32>,
-        gpu_accessible: bool,
+        gpu_pinned: bool,
         use_hugepages: bool,
     },
 }
@@ -310,7 +329,7 @@ pub enum MemoryType {
 impl MemoryAllocator {
     /// Allocate memory at specified location
     pub fn allocate(
-        &mut self,
+        &self,
         size: usize,
         location: MemoryLocation,
     ) -> Result<Box<dyn MemoryBuffer>> {
@@ -318,8 +337,8 @@ impl MemoryAllocator {
             MemoryLocation::GpuVulkan { device_id } => {
                 self.vulkan_context.allocate(size, device_id)
             }
-            MemoryLocation::CpuHost { numa_node, gpu_accessible, use_hugepages } => {
-                if gpu_accessible {
+            MemoryLocation::CpuHost { numa_node, gpu_pinned, use_hugepages } => {
+                if gpu_pinned {
                     self.cpu_allocator.allocate_gpu_pinned(size)
                 } else if use_hugepages {
                     self.cpu_allocator.allocate_hugepage(size, numa_node)
@@ -332,19 +351,6 @@ impl MemoryAllocator {
         }
     }
 
-    /// Allocate with automatic location selection (Phase 2 / scope detection)
-    pub fn allocate_auto(
-        &mut self,
-        size: usize,
-        my_location: &ProcessLocation,
-        peer_location: &ProcessLocation,
-        channel_profile: ChannelProfile,
-    ) -> Result<Box<dyn MemoryBuffer>> {
-        let scope = CommunicationScope::from_locations(my_location, peer_location);
-
-        let location = select_memory_location(scope, channel_profile);
-        self.allocate(size, location)
-    }
 }
 ```
 
@@ -354,12 +360,7 @@ impl MemoryAllocator {
 
 ```rust
 // Allocate GPU buffer with automatic export
-let buffer = allocator.allocate_auto(
-    1MB,
-    &my_location,
-    &peer_location,
-    ChannelProfile::GpuPreferred,
-)?;
+let buffer = allocator.allocate(1MB, MemoryLocation::GpuVulkan { device_id: 0 })?;
 // Returns: GPU buffer with export handle
 
 // Send via channel (zero-copy via shared GPU memory)
@@ -370,12 +371,7 @@ channel.send(frame_with_buffer)?;
 
 ```rust
 // Allocate CPU buffer with MPI transport
-let buffer = allocator.allocate_auto(
-    1MB,
-    &my_location,
-    &peer_location,
-    ChannelProfile::CpuShared,
-)?;
+let buffer = allocator.allocate(1MB, MemoryLocation::CpuHost { gpu_pinned: false })?;
 // Returns: CPU buffer (huge pages for efficiency)
 
 // Send via channel (MPI serialization)
@@ -398,7 +394,7 @@ let cpu_buffer = allocator.allocate(
     1MB,
     MemoryLocation::CpuHost {
         numa_node: Some(0),
-        gpu_accessible: true,   // Pinned for GPU
+        gpu_pinned: true,   // Pinned for GPU
         use_hugepages: false,   // Staging buffers small
     }
 )?;
@@ -426,23 +422,16 @@ pub fn select_memory_location(
             // CPU memory: shared memory on same host
             MemoryLocation::CpuHost {
                 numa_node: None,
-                gpu_accessible: false,
+                gpu_pinned: false,
                 use_hugepages: false,
             }
         }
-        (CommunicationScope::Remote, ChannelProfile::HighThroughput) => {
-            // CPU with hugepages: MPI over large buffers
+        (CommunicationScope::Remote, ChannelProfile::GpuPreferred)
+        | (CommunicationScope::Remote, ChannelProfile::CpuShared) => {
+            // CPU memory for remote communication
             MemoryLocation::CpuHost {
                 numa_node: None,
-                gpu_accessible: false,
-                use_hugepages: true,
-            }
-        }
-        (CommunicationScope::Remote, ChannelProfile::LowLatency) => {
-            // CPU small buffer: MPI latency-optimized
-            MemoryLocation::CpuHost {
-                numa_node: None,
-                gpu_accessible: false,
+                gpu_pinned: false,
                 use_hugepages: false,
             }
         }
@@ -450,10 +439,8 @@ pub fn select_memory_location(
 }
 
 pub enum ChannelProfile {
-    HighThroughput,  // Large frames, network bandwidth-bound
-    LowLatency,      // Small messages, latency-bound
     GpuPreferred,    // GPU buffers (local only)
-    CpuShared,       // CPU shared memory (local only)
+    CpuShared,       // CPU shared memory
 }
 ```
 
@@ -537,21 +524,20 @@ pub enum AllocationError {
 
 ```rust
 pub fn allocate_with_fallback(
-    allocator: &mut MemoryAllocator,
+    allocator: &MemoryAllocator,
     size: usize,
     primary: MemoryLocation,
-    fallback: Option<MemoryLocation>,
 ) -> Result<Box<dyn MemoryBuffer>> {
     // Try primary location
-    match allocator.allocate(size, primary.clone()) {
+    match allocator.allocate(size, primary) {
         Ok(buffer) => Ok(buffer),
         Err(e) => {
-            tracing::warn!("Primary allocation failed: {:?}, trying fallback", e);
-            if let Some(fb) = fallback {
-                allocator.allocate(size, fb)
-            } else {
-                Err(e)
-            }
+            let fb = match primary {
+                MemoryLocation::GpuVulkan { .. } => MemoryLocation::CpuHost { gpu_pinned: false },
+                MemoryLocation::CpuHost { gpu_pinned: true } => MemoryLocation::CpuHost { gpu_pinned: false },
+                MemoryLocation::CpuHost { gpu_pinned: false } => return Err(e),
+            };
+            allocator.allocate(size, fb)
         }
     }
 }
@@ -564,11 +550,6 @@ allocate_with_fallback(
     allocator,
     1MB,
     MemoryLocation::GpuVulkan { device_id: 0 },
-    Some(MemoryLocation::CpuHost {
-        numa_node: None,
-        gpu_accessible: false,
-        use_hugepages: true,
-    }),
 )?
 ```
 
@@ -590,8 +571,8 @@ allocate_with_fallback(
 
 | Location | Throughput | Notes |
 | -------- | ---------- | ----- |
-| GPU DEVICE_LOCAL | 100-900 GB/s | GPU↔GPU bandwidth |
-| GPU HOST_VISIBLE | 10-50 GB/s | GPU↔CPU via PCIe |
+| GPU DEVICE_LOCAL | 100-900 GB/s | GPU?GPU bandwidth |
+| GPU HOST_VISIBLE | 10-50 GB/s | GPU?CPU via PCIe |
 | CPU (intra-socket) | 50-100 GB/s | Memory bandwidth |
 | CPU (cross-socket) | 10-50 GB/s | NUMA latency |
 | Network (MPI) | 1-100 GB/s | Network bandwidth |
@@ -614,14 +595,14 @@ allocate_with_fallback(
 - **Hugepages:** supported via `/dev/hugepages`
 - **NUMA:** libnuma for topology and allocation
 - **GPU pinning:** CUDA APIs
-- **External memory:** VkExternalMemory via `ExternalMemoryHandle`
+- **External memory:** VkExternalMemory via `InterprocessMemoryHandle`
 
 ### Windows
 
 - **Hugepages:** Not directly supported (use aligned malloc)
 - **NUMA:** Windows API (GetNumaNodeProcessorMask)
 - **GPU pinning:** CUDA APIs
-- **External memory:** VkExternalMemory via `ExternalMemoryHandle`
+- **External memory:** VkExternalMemory via `InterprocessMemoryHandle`
 
 ---
 
@@ -632,7 +613,7 @@ allocate_with_fallback(
 ```rust
 #[test]
 fn test_gpu_allocation() {
-    let mut allocator = MemoryAllocator::new();
+    let allocator = MemoryAllocator::new();
     let buffer = allocator.allocate(
         1024*1024,
         MemoryLocation::GpuVulkan { device_id: 0 }
@@ -644,12 +625,12 @@ fn test_gpu_allocation() {
 
 #[test]
 fn test_cpu_numa_allocation() {
-    let mut allocator = MemoryAllocator::new();
+    let allocator = MemoryAllocator::new();
     let buffer = allocator.allocate(
         1024*1024,
         MemoryLocation::CpuHost {
             numa_node: Some(0),
-            gpu_accessible: false,
+            gpu_pinned: false,
             use_hugepages: false,
         }
     ).expect("NUMA allocation failed");
@@ -660,7 +641,7 @@ fn test_cpu_numa_allocation() {
 
 #[test]
 fn test_gpu_external_memory_export() {
-    let mut allocator = MemoryAllocator::new();
+    let allocator = MemoryAllocator::new();
     let gpu_buffer = allocator.allocate(
         1024*1024,
         MemoryLocation::GpuVulkan { device_id: 0 }
@@ -672,18 +653,12 @@ fn test_gpu_external_memory_export() {
 
 #[test]
 fn test_allocation_fallback() {
-    let mut allocator = MemoryAllocator::new();
+    let allocator = MemoryAllocator::new();
 
     // Try GPU, fallback to CPU
-    let buffer = allocate_with_fallback(
-        &mut allocator,
+    let buffer = allocator.allocate_with_fallback(
         1024*1024,
         MemoryLocation::GpuVulkan { device_id: 0 },
-        Some(MemoryLocation::CpuHost {
-            numa_node: None,
-            gpu_accessible: false,
-            use_hugepages: true,
-        })
     ).expect("Allocation failed");
 
     // Should have allocated something
@@ -706,7 +681,7 @@ fn test_allocation_fallback() {
 
 1. **GPU Memory (Vulkan)**
    - Cross-API support (CUDA, OpenCL, OpenGL)
-   - External memory export (`ExternalMemoryHandle`)
+   - External memory export (`InterprocessMemoryHandle`)
    - Zero-copy inter-process sharing
 
 2. **CPU Memory (Host Buffers)**

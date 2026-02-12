@@ -102,7 +102,7 @@ fn test_channel_gpu_communication() {
         .spawn_pair()?;  // Custom helper
 
     // Producer (in separate process)
-    let buffer = allocator.allocate_auto(...)?;
+    let buffer = allocator.allocate(...)?;
     channel.send(buffer)?;
 
     // Consumer (in main process)
@@ -244,7 +244,7 @@ not strict pass/fail in CI unless running on stable, dedicated hardware.
 #[bench]
 fn bench_gpu_message_latency(b: &mut Bencher) {
     let allocator = MemoryAllocator::new();
-    let buffer = allocator.allocate_auto(...).expect("alloc");
+    let buffer = allocator.allocate(...).expect("alloc");
     let channel = Channel::new(&allocator, &my_loc, &peer_loc).expect("channel");
 
     b.iter(|| {
