@@ -14,6 +14,20 @@ NUMA support is deferred from the first implementation and treated as optional f
 - Parallel allocation support via thread-safe internal mutability in allocator backends
 - Optional future extension: NUMA-aware CPU allocation
 
+## Applied Follow-up Learnings
+
+- CPU allocation cap is now explicit via `CpuAllocationConfig` and can be injected into
+  `MemoryAllocator::with_cpu_config(...)`.
+- CPU allocation logic is exposed as `CpuAllocator` to avoid implicit global configuration in tests and call sites.
+- `CpuMemoryBuffer` now supports safer slice-first access (`as_slice` / `as_mut_slice`) in addition to raw pointers.
+- Fault-injection paths used for coverage stay test-only; production paths do not branch on test hooks.
+- Platform-specific implementation code should be split by OS (`mod.rs` + `unix.rs` + `windows.rs`) when complexity
+  goes beyond trivial wrappers.
+- Layer 2 receive materialization is channel-owned and allocator-driven; Phase 2 provides the allocation primitives
+  (`MemoryAllocator`, `CpuAllocator`) used by channel allocator implementations.
+- Channel allocators are expected to be fixed-target (`CPU` or `GPU`) by default; composition wrappers can add hybrid
+  policies without forcing dual-branch logic into every allocator.
+
 ## Deliverables
 
 - `MemoryAllocator` with GPU + CPU backends

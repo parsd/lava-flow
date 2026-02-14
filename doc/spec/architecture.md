@@ -1,348 +1,132 @@
-﻿﻿# lava-flow Architecture
+# lava-flow Architecture
 
 ## TL;DR
 
-Two-layer design separating memory allocation (Layer 1: GPU + CPU) from channel transports (Layer 2: Vulkan
-IPC, CPU shared memory, MPI). Scope detection routes local traffic through Vulkan IPC or CPU shared memory and remote
-traffic through MPI.
+lava-flow uses a two-layer architecture:
 
-## Two-Layer Architecture
+- Layer 1 (`memory`): allocates and exports/imports CPU/GPU buffers.
+- Layer 2 (`channels`): routes frames across local/remote transports and exposes directional endpoints.
+
+Receive allocation is receiver-owned (configured on receiver construction), while sender paths remain allocation-policy
+free.
+
+## Layered Model
 
 ```mermaid
-flowchart TB
-  MA[MemoryAllocator]
-  SD[Scope Detection compare hostnames]
-
-  subgraph "Layer 1: Memory and Allocator"
-    direction LR
-    GPU[GPU Memory Vulkan]
-    CPU[CPU Memory Host Standard]
+flowchart LR
+  subgraph L1[Layer 1: Memory]
+    MA[MemoryAllocator]
+    CPU[CpuAllocator]
+    GPU[VulkanAllocator]
   end
 
-  subgraph "Layer 2: Channel Transports"
-    direction LR
-    VI[Vulkan IPC]
-    MPI[MPI Messaging]
+  subgraph L2[Layer 2: Channels]
+    SB[SenderBuilder]
+    RB[ReceiverBuilder]
+    TX[Sender]
+    RX[Receiver]
+    TR[Transport Selection]
   end
 
-  MA --> GPU
   MA --> CPU
-  GPU --> SD
-  CPU --> SD
-  SD --> VI
-  SD --> MPI
+  MA --> GPU
+  SB --> TX
+  RB --> RX
+  RX --> MA
+  TX --> TR
+  RX --> TR
 ```
 
-Note: local CPU channels use OS shared memory, while local GPU channels use Vulkan IPC.
+## Public API Direction
 
-## Layer 1: Memory & Allocator
-
-### Responsibility
-
-Allocate GPU and CPU memory with:
-
-- Single unified API
-- Cross-API GPU memory (importable by CUDA, OpenCL, OpenGL)
-- Multi-strategy CPU allocation (performance-tuned per scenario)
-- Transparent fallback (if GPU unavailable, use CPU)
-
-### GPU Memory (Vulkan-Based)
-
-#### VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-
-- Fastest GPU memory (on GPU)
-- 100-900 GB/s throughput
-- Only GPU-accessible
-- Ideal for GPU-GPU communication
-
-#### VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-
-- CPU-accessible via PCIe
-- 10-50 GB/s throughput
-- Useful for CPU→GPU staging
-
-#### External Memory Export
-
-```text
-Linux:  VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT (file descriptor)
-Windows: VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT (HANDLE)
-```
-
-Enables GPU memory sharing: Process A exports → Process B imports via OS handle.
-
-### CPU Memory (Host Buffers) — Four Strategies
-
-| Strategy | Throughput | Latency | Use Case |
-| -------- | ---------- | ------- | -------- |
-| **Standard** | 50-100 GB/s | 1-10 us | Default, small buffers |
-| **NUMA** | 10-100 GB/s | Reduced | Multi-socket systems |
-| **Hugepages** | 50-100 GB/s | 1-10 us | Large buffers (remote) |
-| **GPU-pinned** | PCIe bandwidth | PCIe latency | CPU→GPU staging |
-
-### Unified API
+The channel API is symmetric on payload `Frame`, while metadata is exchanged as a separate value.
 
 ```rust
-pub trait MemoryAllocator {
-    // Explicit allocation with location hint
-    fn allocate(&mut self, size: usize, location: MemoryLocation)
-        -> Result<Box<dyn MemoryBuffer>, Error>;
-}
+let tx = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone())
+    .with_metadata_encoding(MetadataEncoding::Cbor)
+    .build()?;
+
+let rx = ChannelBuilder::receiver(my_loc, peer_loc)
+    .with_allocator(Arc::new(CpuChannelAllocator::new(cpu_allocator)))
+    .with_metadata_encoding(MetadataEncoding::Cbor)
+    .build()?;
+
+let frame = Frame::Owned(payload_buffer);
+let meta = ImageMeta {
+    used_size: payload_bytes,
+    width: 1920,
+    height: 1080,
+};
+
+tx.send(frame, &meta)?;
+let (frame, meta) = rx.recv::<ImageMeta>()?;
+let used = meta.used_size();
 ```
 
-## Layer 2: Channel Transports
+Key points:
 
-### Responsibility
+- Sender side does not require an allocator.
+- Receiver side owns materialization policy via its configured allocator.
+- Endpoint introspection is lightweight: `scope()`, `receive_representation()`, and `configured_buffer_kind()`.
+- `recv::<M>()` is the default typed path; `recv_map()` is the dynamic fallback.
+- Metadata always carries `used_size` for payload validity.
 
-Provide producer/consumer message passing with:
+## Transport Routing
 
-- Automatic transport selection (Vulkan IPC, CPU shared memory, or MPI)
-- Non-blocking API (async/await integration)
-- Guaranteed message ordering
-- Proper error handling and recovery
-
-### Local Transport: Vulkan IPC
-
-**For:** GPU-to-GPU on same host
-
-#### How it works
-
-1. Process A allocates GPU memory (Vulkan, DEVICE_LOCAL)
-2. Exports external memory handle (file descriptor on Linux)
-3. Process B imports handle, gains access to same GPU memory
-4. Message is GPU memory pointer + metadata
-5. Receiver uses pointer directly (zero-copy)
-
-#### Performance
-
-```text
-Latency:    < 100 ns (shared GPU memory)
-Throughput: 100-900 GB/s (full GPU bandwidth)
-Copy cost:  0 bytes
-```
-
-**See:** [ADR-003: External Memory Handle Types](../adr/003-external-memory-handle-types.md)
-
-### Local Transport: CPU Shared Memory
-
-**For:** CPU-to-CPU on same host
-
-#### How it works
-
-1. Process A allocates CPU memory (standard or NUMA)
-2. Uses OS shared memory to expose the buffer to Process B
-3. Metadata + synchronization sent via shared control channel
-4. Receiver reads directly from shared RAM (zero-copy)
-
-#### Performance
-
-```text
-Latency:    1-10 us (shared memory, no network)
-Throughput: 50-100 GB/s (host memory bandwidth)
-Copy cost:  0 bytes
-```
-
-### Remote Transport: MPI
-
-**For:** CPU-to-CPU on different hosts
-
-#### How it works
-
-1. Process A allocates CPU memory (hugepages for remote)
-2. Calls `MPI_Send()` with buffer pointer
-3. MPI runtime transfers data (RDMA if available, TCP fallback)
-4. Process B receives via `MPI_Recv()`
-5. Data in receiver's memory space
-
-#### Performance
-
-```text
-Latency:    ~10 us (network + MPI overhead)
-Throughput: 1-100 GB/s (network-dependent)
-Copy cost:  1x PCIe for staging, 1x network transfer
-```
-
-#### Benefits
-
-- Proven, stable for HPC
-- Vendor optimizations (OpenMPI with UCX)
-- GPU-aware MPI available
-- Process-level sync (not just collective operations)
-
-**See:** [ADR-006: MPI for Remote Communication](../adr/006-mpi-for-inter-node.md)
-
-## Scope Detection
-
-### Algorithm
+Transport choice is derived from communication scope and payload characteristics.
 
 ```rust
-pub fn detect_scope(
-    my_location: &ProcessLocation,     // e.g., "gpu-node-0"
-    peer_location: &ProcessLocation,   // e.g., "gpu-node-1"
-) -> CommunicationScope {
-    if my_location.hostname == peer_location.hostname {
-        CommunicationScope::Local
-    } else {
-        CommunicationScope::Remote
+fn select_transport(scope: CommunicationScope, frame: &Frame) -> TransportKind {
+    match (scope, frame_is_gpu(frame)) {
+        (CommunicationScope::Local, true) => TransportKind::VulkanIpc,
+        (CommunicationScope::Local, false) => TransportKind::CpuSharedMemory,
+        (CommunicationScope::Remote, _) => TransportKind::MpiPointToPoint,
     }
 }
 ```
 
-### Data Flow
+## Receive Behavior
 
-```mermaid
-flowchart TD
-  A[ProcessLocation my_location hostname node_id device_id]
-  B[ProcessLocation peer_location hostname node_id device_id]
-  C[Compare hostnames]
-  D{Same hostname}
-  E[CommunicationScope Local]
-  F[CommunicationScope Remote]
-  G[Vulkan IPC or CPU shared memory]
-  H[MPI transport]
+Receiver properties are fixed at construction and queried via:
 
-  A --> C
-  B --> C
-  C --> D
-  D -->|yes| E
-  D -->|no| F
-  E --> G
-  F --> H
-```
+- `receive_representation()`
+- `configured_buffer_kind()`
 
-### Usage
+Receive variants:
 
-```rust
-// Users provide location info
-let my_loc = ProcessLocation::from_hostname();  // Detects automatically
-let peer_loc = ProcessLocation::from_config("path/to/json");
+- typed: `recv::<M>() -> (Frame, M)`
+- dynamic: `recv_map() -> (Frame, MessageMeta)`
 
-// Library detects scope automatically
-let channel = Channel::create(&allocator, &my_loc, &peer_loc)?;
-// -> If same host: Vulkan IPC for GPU buffers or CPU shared memory for CPU buffers
-// -> If different host: MPI transport
-```
+In both cases metadata defines the valid payload region through `used_size`.
 
-### Advantages
+## Allocation Policy Contract
 
-- No user configuration needed
-- Single codebase works everywhere
-- Optimal transport per scenario
-- Transparent switching
+Layer-2 channel allocators are fixed-target by default:
 
-**See:** [ADR-001: Scope-Based Backend Selection](../adr/001-scope-detection.md)
+- `CpuChannelAllocator` delivers `MemoryLocation::CpuHost { .. }`
+- `GpuChannelAllocator` delivers `MemoryLocation::GpuVulkan { .. }`
 
-## Memory Type Selection Matrix
+Composite/hybrid allocators may exist, but the base contract avoids mandatory dual CPU/GPU branching in every allocator
+implementation.
 
-### Local (Same Host)
+## Implementation Conventions
 
-| Source | Destination | Memory Type | Transport | Latency | Throughput |
-| ------ | ----------- | ----------- | --------- | ------- | ---------- |
-| GPU | GPU (same host) | Vulkan GPU | Vulkan IPC | < 100 ns | 100-900 GB/s |
-| CPU | CPU (same host) | CPU standard | Shared memory | 1-10 us | 50-100 GB/s |
-| CPU | CPU (multi-socket) | CPU NUMA | Shared memory | 5-100 us | 10-100 GB/s |
-| CPU | GPU (same host) | CPU GPU-pinned | PCIe | PCIe latency | PCIe bandwidth |
+- For non-trivial OS-specific logic, split files by platform:
+  - shared API/orchestration in `mod.rs`
+  - Unix logic in `unix.rs`
+  - Windows logic in `windows.rs`
+- Prioritize decisions as:
+  1. security and correctness
+  2. API stability
+  3. coverage completeness
+- Keep test-only fault injection out of production runtime branches.
 
-### Remote (Different Hosts)
+## Related Docs
 
-| Source | Destination | Memory Type | Transport | Latency | Throughput |
-| ------ | ----------- | ----------- | --------- | ------- | ---------- |
-| CPU | CPU (different host) | CPU hugepages | MPI | ~10 us | 1-100 GB/s |
-| GPU | GPU (different host) | CPU staging | MPI | ~10 us | 1-100 GB/s |
-| Mixed | Mixed | CPU hugepages | MPI | ~10 us | 1-100 GB/s |
-
-## Design Decisions
-
-| Decision | Rationale | See |
-| -------- | --------- | --- |
-| Scope-based routing | Automatic optimal transport | [ADR-001](../adr/001-scope-detection.md) |
-| Vulkan allocator | Vendor-neutral GPU memory | [ADR-002](../adr/002-gpu-api-selection.md) |
-| External memory | Zero-copy GPU sharing | [ADR-003](../adr/003-external-memory-handle-types.md) |
-| MPI for remote | Proven HPC standard | [ADR-006](../adr/006-mpi-for-inter-node.md) |
-| thiserror for errors | Idiomatic Rust | [ADR-008](../adr/008-error-handling-approach.md) |
-| Language bindings | Orthogonal to core | [ADR-011](../adr/011-multi-language-bindings.md) |
-| Two-layer arch | Clear separation of concerns | [Design Rational](../plan/design_rationale.md) |
-| Platform support | Supported features by platform | [Platform Support](../platform_support.md) |
-
-## File Structure
-
-```text
-src/
-├── lib.rs                   # Public API
-├── types.rs                 # Phase 1: Core types
-│   ├── ProcessName
-│   ├── ProcessLocation
-│   └── CommunicationScope
-│
-├── error.rs                 # Error types
-│
-├── memory/                  # Layer 1: Phase 2
-│   ├── allocator.rs         # Unified API
-│   ├── gpu.rs               # Vulkan GPU memory
-│   │   ├── Device selection
-│   │   ├── Memory properties
-│   │   └── External export
-│   │
-│   └── cpu/                 # Host memory strategies
-│       ├── standard.rs      # malloc
-│       ├── numa.rs          # NUMA-aware
-│       ├── hugepage.rs      # Large pages
-│       └── gpu_pinned.rs    # GPU-pinned
-│
-└── channels/                # Layer 2: Phase 3-5
-    ├── mod.rs               # Channel trait
-    ├── producer.rs          # Producer API
-    ├── consumer.rs          # Consumer API
-    │
-    └── transports/
-        ├── vulkan_ipc.rs    # local (Phase 3)
-        └── mpi.rs           # remote (Phase 4)
-
-tests/
-├── layer1/                  # Memory layer tests
-│   ├── gpu_memory.rs
-│   ├── cpu_strategies.rs
-│   └── scope_detection.rs
-│
-└── layer2/                  # Channel layer tests
-    ├── vulkan_ipc.rs
-    ├── mpi.rs
-    └── scope_routing.rs
-```
-
-## Performance Targets
-
-### Allocation Latency
-
-| Type | Target | Notes |
-| ---- | ------ | ----- |
-| GPU (Vulkan) | ~100 us | Device alloc overhead |
-| CPU standard | ~1 us | malloc (libc) |
-| CPU NUMA | ~1 us | libnuma |
-| CPU hugepages | ~10 us | mmap + hugetlbfs |
-| CPU GPU-pinned | ~10 us | cudaHostRegister |
-
-### Message Latency
-
-| Path | Target | Notes |
-| ---- | ------ | ----- |
-| GPU<->GPU (same node) | < 100 ns | Shared memory, no copy |
-| CPU<->CPU (same node) | 1-10 us | Shared memory |
-| CPU<->CPU (diff node) | ~10 us | MPI (RDMA if available) |
-
-### Memory Throughput
-
-| Type | Target | Notes |
-| ---- | ------ | ----- |
-| GPU DEVICE_LOCAL | 100-900 GB/s | Full GPU bandwidth |
-| GPU HOST_VISIBLE | 10-50 GB/s | PCIe limited |
-| CPU standard | 50-100 GB/s | Full DDR bandwidth |
-| CPU cross-socket | 10-50 GB/s | NUMA latency |
-| MPI (RDMA) | 100+ GB/s | InfiniBand/RoCE |
-| MPI (TCP) | 1-10 GB/s | Network limited |
-
-## Key References
-
-- **[Layer 1: Memory & Allocator](memory.md)**
-- **[Layer 2: Channel Semantics](channels.md)**
-- **[Design Rationale](../plan/design_rationale.md)**
-- **[Architecture Decision Records](../adr/README.md)**
+- [Memory Spec](memory.md)
+- [Channel Semantics](channels.md)
+- [Design Rationale](../plan/design_rationale.md)
+- [Phase 3](../plan/phase_3.md)
+- [Phase 4](../plan/phase_4.md)
+- [Phase 5](../plan/phase_5.md)
+- [ADR Index](../adr/README.md)

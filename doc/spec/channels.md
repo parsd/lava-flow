@@ -1,117 +1,150 @@
 # Layer 2: Channel Semantics
 
-This document defines the unified channel API and how transports are selected for local vs remote communication.
+This document defines the channel API and transport behavior for local and remote communication.
 
 ## TL;DR
 
-- One `Channel` API across all phases.
-- Transport selection is internal and based on scope + buffer type.
-- MPI is a transport detail, not a separate public API.
+- Distinct builders are used: `SenderBuilder` and `ReceiverBuilder`.
+- Distinct endpoints are used: `Sender` and `Receiver`.
+- `Frame` carries payload only; metadata is separate.
+- Receiver allocation policy is configured once at channel creation.
+- Channel allocators are fixed-target (`CPU` or `GPU`) and allocation-only.
+- Receiver introspection is lightweight and stable: `scope()`, `receive_representation()`, and
+  `configured_buffer_kind()`.
+- Two receive variants are provided:
+  - typed default: `recv::<M>() -> (Frame, M)`
+  - dynamic map: `recv_map() -> (Frame, MessageMeta)`
 
-## API Shape (Unified)
+## API Shape
 
 ```rust
-let channel = Channel::create(&allocator, &my_loc, &peer_loc)?;
-channel.send(frame)?;
-let received = channel.recv()?;
+let tx = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone())
+    .with_metadata_encoding(MetadataEncoding::Cbor)
+    .build()?;
+
+let rx = ChannelBuilder::receiver(my_loc, peer_loc)
+    .with_allocator(Arc::new(CpuChannelAllocator::new(cpu_allocator)))
+    .with_metadata_encoding(MetadataEncoding::Cbor)
+    .build()?;
+
+let frame = Frame::Owned(payload_buffer);
+let meta = ImageMeta {
+    used_size: payload_bytes,
+    width: 1920,
+    height: 1080,
+};
+
+tx.send(frame, &meta)?;
+let (frame, meta) = rx.recv::<ImageMeta>()?;
+let used = meta.used_size();
+
+// Dynamic fallback variant
+let (frame, map_meta) = rx.recv_map()?;
+let used = map_meta.used_size;
 ```
 
-## Receive APIs (Planned)
+### Why Distinct Builders
 
-To support platform-agnostic receive logic while keeping performance paths explicit, the channel API exposes two
-receive variants:
+Distinct builders avoid typestate complexity while preserving normal builder ergonomics:
+
+- sender options stay sender-specific
+- receiver options stay receiver-specific
+- modifier ordering remains natural
+- `build()` return type is always unambiguous
+
+## Endpoint and Frame Model
 
 ```rust
-pub enum RecvPolicy {
-    /// Require direct placement into the requested target location.
-    Strict,
-    /// Allow staging (for example pinned CPU -> GPU copy) when direct placement is unavailable.
-    AllowStaging,
-    /// Prefer direct placement and allow staging as a fallback.
-    Auto,
+pub enum Frame {
+    External(ExternalBufferRef),
+    Owned(MemoryBuffer),
 }
 
-pub enum MetadataEncoding {
-    Json,
-    Cbor,
-    MessagePack,
+pub trait ChannelMetadata: Serialize + DeserializeOwned {
+    fn used_size(&self) -> usize;
 }
 
-pub struct RecvAllocOptions {
-    /// Caller hint for where payload should land if transport supports it.
-    pub preferred_location: MemoryLocation,
-    /// How fallback/staging behavior is handled.
-    pub policy: RecvPolicy,
+pub enum ReceiveRepresentation {
+    ExternalShare,
+    DirectTransfer,
+    Materialized,
 }
 
-pub struct RecvIntoOptions {
-    /// How fallback/staging behavior is handled.
-    pub policy: RecvPolicy,
+pub enum BufferKind {
+    Cpu,
+    Gpu,
 }
 
-impl Channel {
-    pub fn recv_alloc(
-        &self,
-        allocator: &MemoryAllocator,
-        options: RecvAllocOptions,
-    ) -> Result<ReceivedFrame>;
+impl Sender {
+    pub fn send<M: ChannelMetadata>(&self, frame: Frame, metadata: &M) -> Result<()>;
+    pub fn send_map(&self, frame: Frame, metadata: MessageMeta) -> Result<()>;
+    pub fn scope(&self) -> CommunicationScope;
+}
 
-    pub fn recv_into(
-        &self,
-        target: &mut MemoryBuffer,
-        staging: Option<&mut CpuMemoryBuffer>,
-        options: RecvIntoOptions,
-    ) -> Result<ReceivedFrame>;
-
-    /// Convenience wrapper using default receive options.
-    pub fn recv_alloc_default(
-        &self,
-        allocator: &MemoryAllocator,
-        preferred_location: MemoryLocation,
-    ) -> Result<ReceivedFrame>;
-
-    /// Convenience wrapper for strict receive-into behavior.
-    pub fn recv_into_strict(
-        &self,
-        target: &mut MemoryBuffer,
-        staging: Option<&mut CpuMemoryBuffer>,
-    ) -> Result<ReceivedFrame>;
+impl Receiver {
+    pub fn recv<M: ChannelMetadata>(&self) -> Result<(Frame, M)>;
+    pub fn recv_map(&self) -> Result<(Frame, MessageMeta)>;
+    pub fn scope(&self) -> CommunicationScope;
+    pub fn receive_representation(&self) -> ReceiveRepresentation;
+    pub fn configured_buffer_kind(&self) -> Option<BufferKind>;
 }
 ```
 
 Rationale:
 
-- `recv_alloc`: simple platform-agnostic usage where channel allocates destination memory.
-- `recv_into`: caller-managed memory path for streaming performance and custom pooling/ring-buffer strategies.
-- `recv_alloc_default` / `recv_into_strict`: ergonomic wrappers for common call paths.
+- `Frame` stays non-generic and focused on payload ownership/memory.
+- Metadata concerns stay separate from payload concerns.
+- Typed metadata (`recv::<M>()`) is the common ergonomic path.
+- Dynamic metadata (`recv_map()`) remains available for schema-less workflows.
 
-Default guidance:
+## Channel Allocator Model
 
-- Prefer `RecvPolicy::Strict` as the default to avoid implicit slow-path behavior.
-- Callers opt in to `AllowStaging` or `Auto` when fallback copies are acceptable.
+Receiver materialization is channel-owned and configured once at receiver creation.
+
+```rust
+pub trait ChannelAllocator: Send + Sync {
+    /// Fixed output target for materialized payloads.
+    fn delivery_target(&self) -> MemoryLocation;
+    /// Allocate destination memory using the allocator's fixed-target strategy.
+    fn allocate(&self, size: usize) -> Result<MemoryBuffer>;
+}
+```
+
+Expected implementations:
+
+- `CpuChannelAllocator` (CPU target)
+- `GpuChannelAllocator` (GPU target)
+- Optional composite wrappers if needed
+
+Notes:
+
+- `local_receive_mode` is not part of allocator API.
+- Local receive behavior is channel runtime policy; allocator is used when materialization is needed.
+- Strategy details (ring/arena/hybrid/pinned) stay allocator-internal.
 
 ## Transport Selection (Internal)
 
-- **Local + GPU buffer:** Vulkan IPC (external memory handles)
-- **Local + CPU buffer:** shared memory
-- **Remote:** MPI point-to-point (CPU staging if needed)
+- **Local + GPU payload:** Vulkan IPC (external memory handles)
+- **Local + CPU payload:** shared memory
+- **Remote:** MPI point-to-point (including direct-transfer capable paths where available)
 
 ```rust
-fn select_transport(scope: CommunicationScope, buffer: &dyn MemoryBuffer) -> Transport {
-    match (scope, buffer.is_gpu()) {
-        (CommunicationScope::Local, true) => Transport::VulkanIpc,
-        (CommunicationScope::Local, false) => Transport::CpuSharedMemory,
-        (CommunicationScope::Remote, _) => Transport::MpiPointToPoint,
+fn select_transport(scope: CommunicationScope, frame: &Frame) -> TransportKind {
+    match (scope, frame_is_gpu(frame)) {
+        (CommunicationScope::Local, true) => TransportKind::VulkanIpc,
+        (CommunicationScope::Local, false) => TransportKind::CpuSharedMemory,
+        (CommunicationScope::Remote, _) => TransportKind::MpiPointToPoint,
     }
 }
 ```
 
-## Metadata Envelope (Planned)
+## Why No `recv_into` In Core API
 
-Payload and metadata are transported separately:
+- `recv_into` couples channel API to concrete buffer ownership details.
+- Ring/arena/hybrid reuse belongs in allocator strategy and can be implemented without expanding channel API.
+- Interop integrations (Torch/NumPy/etc.) are simpler with `Frame::External` / `Frame::Owned` envelopes.
 
-- Payload: `MemoryBuffer` and transport handles.
-- Metadata: serialized control-plane envelope.
+## Metadata Envelope
 
 ```rust
 pub type MetadataMap = std::collections::BTreeMap<String, MetaValue>;
@@ -133,21 +166,27 @@ pub struct MessageMeta {
 }
 ```
 
-`Channel` also supports typed metadata via serde:
+Typed metadata remains serde-driven:
 
-- send typed: `M: Serialize`
-- receive typed: `M: DeserializeOwned`
-- receive dynamic: `MessageMeta`
+- send typed: `M: ChannelMetadata`
+- receive typed: `M: ChannelMetadata`
+- receive dynamic: `MessageMeta` via `recv_map()`
 
-Serialization format is configured per channel (for example via `MetadataEncoding`).
+Metadata contract:
+
+- Metadata is mandatory for every message.
+- `used_size` defines the valid payload region for each message.
+- Receivers must use `used_size` rather than assuming full buffer capacity is filled.
 
 ## Semantics (All Transports)
 
 - **Ordering:** producer order is preserved per channel
-- **Ownership:** sender must not mutate in-flight buffers
+- **Ownership:** sender must not mutate in-flight payloads
 - **Backpressure:** bounded queues or transport-level flow control
 - **Errors:** surfaced via unified `Result<T, Error>`
-- **Synchronization:** in Phase 5+, `Channel` handles external semaphore wait/signal internally
+- **Observability:** receiver properties via `scope()` / `receive_representation()` /
+  `configured_buffer_kind()`
+- **Synchronization:** in Phase 5+, channel manages external semaphore wait/signal internally
 
 ## Related Docs
 

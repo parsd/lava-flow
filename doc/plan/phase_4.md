@@ -3,13 +3,15 @@
 ## TL;DR
 
 Implement Layer 2 for remote communication: MPI point-to-point transport with rank resolution and scope detection.
-The public `Channel` API remains identical to Phase 3; MPI is an internal transport.
+The public directional endpoint API remains identical to Phase 3; MPI is an internal transport.
+Remote receive materialization uses receiver-channel allocator strategy.
 
 ## Scope
 
 - MPI init/finalize wrapper
 - Rank resolution from process locations
-- MpiTransport send/recv (blocking and optional non-blocking)
+- `MpiTransport` send/recv (blocking and optional non-blocking)
+- Receiver representation mapping to `DirectTransfer` / `Materialized` for remote channels
 - CI-safe tests gated behind `mpirun`
 
 ## Deliverables
@@ -22,9 +24,14 @@ The public `Channel` API remains identical to Phase 3; MPI is an internal transp
 ## Example (API Shape)
 
 ```rust
-let channel = Channel::create(&allocator, &my_loc, &peer_loc)?;
-channel.send(frame)?;
-let received = channel.recv()?;
+let tx = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone()).build()?;
+let rx = ChannelBuilder::receiver(my_loc, peer_loc)
+    .with_allocator(Arc::new(CpuChannelAllocator::new(cpu_allocator)))
+    .build()?;
+
+tx.send(frame, &meta)?;
+let (frame, meta) = rx.recv::<ImageMeta>()?;
+let used = meta.used_size();
 ```
 
 ## Related Docs
