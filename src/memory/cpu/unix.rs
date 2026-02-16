@@ -30,9 +30,7 @@ trait Syscalls: Sync {
         // Fallback path for older platforms lacking F_DUPFD_CLOEXEC support.
         let duplicated_fd = self.dup(fd)?;
         let owned_fd = unsafe { OwnedFd::from_raw_fd(duplicated_fd) };
-        if let Err(err) = self.fcntl_setfd_cloexec(owned_fd.as_raw_fd()) {
-            return Err(err);
-        }
+        self.fcntl_setfd_cloexec(owned_fd.as_raw_fd())?;
         Ok(owned_fd)
     }
 
@@ -123,11 +121,6 @@ impl SharedMemoryRegion {
                 });
             }
         };
-        if owned_mapping.as_raw_fd() < 0 {
-            return Err(LavaFlowError::UnsupportedInterprocessHandle {
-                kind: "invalid CpuSharedFd",
-            });
-        }
 
         let raw_ptr = SYSCALLS.mmap(&owned_mapping, size)?;
 
@@ -359,6 +352,23 @@ mod tests {
     }
 
     #[test]
+    fn open_shared_region_rejects_gpu_handle() {
+        let gpu_handle = InterprocessMemoryHandle::from_gpu_id(1).expect("create gpu handle");
+        let err = SharedMemoryRegion::from_handle(
+            BUFFER_SIZE,
+            hard_max_cpu_allocation_size(),
+            gpu_handle,
+        )
+        .expect_err("gpu handle must be rejected");
+        assert!(matches!(
+            err,
+            LavaFlowError::UnsupportedInterprocessHandle {
+                kind: "GpuOpaqueFd"
+            }
+        ));
+    }
+
+    #[test]
     fn dup_fd_fallback_path_succeeds() {
         let buffer = allocate_standard_for_test(BUFFER_SIZE).expect("allocate buffer");
         let handle = run_with_fail("dup_force_fallback", || buffer.shared_handle())
@@ -545,6 +555,77 @@ mod tests {
             err,
             LavaFlowError::SharedMemoryOperation {
                 operation: "mmap",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn munmap_syscall_error_path() {
+        let err = RealSyscalls
+            .munmap(std::ptr::null_mut(), 0)
+            .expect_err("munmap should fail for zero length");
+        assert!(matches!(
+            err,
+            LavaFlowError::SharedMemoryOperation {
+                operation: "munmap",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn fcntl_setfd_cloexec_syscall_error_path() {
+        let err = RealSyscalls
+            .fcntl_setfd_cloexec(-1)
+            .expect_err("fcntl_setfd should fail for invalid fd");
+        assert!(matches!(
+            err,
+            LavaFlowError::SharedMemoryOperation {
+                operation: "fcntl_cloexec",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn getrandom_syscall_error_path() {
+        let err = RealSyscalls
+            .getrandom(std::ptr::null_mut(), BUFFER_SIZE, 0)
+            .expect_err("getrandom should fail for null buffer");
+        assert!(matches!(
+            err,
+            LavaFlowError::SharedMemoryOperation {
+                operation: "getrandom",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn open_syscall_error_path() {
+        let missing = b"/definitely/not/found/lava-flow\0";
+        let err = RealSyscalls
+            .open(missing.as_ptr().cast::<libc::c_char>(), libc::O_RDONLY)
+            .expect_err("open should fail for missing file");
+        assert!(matches!(
+            err,
+            LavaFlowError::SharedMemoryOperation {
+                operation: "open",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn read_syscall_error_path() {
+        let err = RealSyscalls
+            .read(-1, std::ptr::null_mut(), BUFFER_SIZE)
+            .expect_err("read should fail for invalid fd");
+        assert!(matches!(
+            err,
+            LavaFlowError::SharedMemoryOperation {
+                operation: "read",
                 ..
             }
         ));

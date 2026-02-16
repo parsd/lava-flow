@@ -184,6 +184,8 @@ impl Syscalls for RealSyscalls {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::RawHandle;
 
     const BUFFER_SIZE: usize = 64;
     const SMALL_SIZE: usize = 1;
@@ -195,6 +197,13 @@ mod tests {
     fn run_with_fail<T>(op: &'static str, f: impl FnOnce() -> T) -> T {
         support::set_fail(op);
         f()
+    }
+
+    fn cpu_raw_handle(handle: &InterprocessMemoryHandle) -> RawHandle {
+        match handle {
+            InterprocessMemoryHandle::CpuSharedWin32Handle(owned) => owned.as_raw_handle(),
+            InterprocessMemoryHandle::GpuOpaqueWin32Handle(_) => panic!("expected cpu handle"),
+        }
     }
 
     #[test]
@@ -265,17 +274,12 @@ mod tests {
 
     #[test]
     fn open_shared_region_reports_map_error_for_closed_cpu_handle() {
-        use std::os::windows::io::AsRawHandle;
-
         let allocator = crate::memory::cpu::Allocator::new();
         let buffer = allocator
             .allocate(BUFFER_SIZE)
             .expect("allocate cpu buffer");
         let handle = buffer.shared_handle().expect("export handle");
-        let raw = match &handle {
-            InterprocessMemoryHandle::CpuSharedWin32Handle(owned) => owned.as_raw_handle(),
-            InterprocessMemoryHandle::GpuOpaqueWin32Handle(_) => panic!("expected cpu handle"),
-        };
+        let raw = cpu_raw_handle(&handle);
         let close_ok = unsafe { windows_sys::Win32::Foundation::CloseHandle(raw) };
         assert_ne!(close_ok, 0, "close duplicated handle");
 
@@ -289,6 +293,24 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn cpu_handle_match_reads_cpu_handle_branch() {
+        let allocator = crate::memory::cpu::Allocator::new();
+        let buffer = allocator
+            .allocate(BUFFER_SIZE)
+            .expect("allocate cpu buffer");
+        let handle = buffer.shared_handle().expect("export handle");
+        let raw = cpu_raw_handle(&handle);
+        assert!(!raw.is_null());
+    }
+
+    #[test]
+    fn cpu_handle_match_panics_for_gpu_handle_branch() {
+        let handle = InterprocessMemoryHandle::from_gpu_id(1).expect("create gpu handle");
+        let result = std::panic::catch_unwind(|| cpu_raw_handle(&handle));
+        assert!(result.is_err(), "gpu handle branch should panic");
     }
 
     #[test]
@@ -332,6 +354,43 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn create_file_mapping_real_syscall_error_path() {
+        let err = RealSyscalls
+            .create_file_mapping(0)
+            .expect_err("zero-sized mapping should fail");
+        assert!(matches!(
+            err,
+            LavaFlowError::SharedMemoryOperation {
+                operation: "CreateFileMappingW",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn duplicate_handle_real_syscall_error_path() {
+        let err = RealSyscalls
+            .duplicate_handle_same_access(std::ptr::null_mut())
+            .expect_err("null source handle must fail");
+        assert!(matches!(
+            err,
+            LavaFlowError::SharedMemoryOperation {
+                operation: "DuplicateHandle",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn drop_guard_returns_for_null_pointer() {
+        let mut region = SharedMemoryRegion::create(BUFFER_SIZE, hard_max_cpu_allocation_size())
+            .expect("create test region");
+        region.ptr = std::ptr::null_mut();
+        region.len = 1;
+        drop(region);
     }
 
     pub(in crate::memory::cpu::windows) mod support {

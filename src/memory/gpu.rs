@@ -109,10 +109,12 @@ impl Allocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env::Guard as EnvGuard;
 
     const BUFFER_SIZE: usize = 64;
     const DEVICE_ID_0: u32 = 0;
     const UNKNOWN_DEVICE_ID: u32 = 99;
+    const ENV_DISABLE_VULKAN: &str = "LAVA_FLOW_DISABLE_VULKAN";
 
     #[test]
     fn allocate_returns_buffer_with_valid_handle() {
@@ -169,5 +171,27 @@ mod tests {
         let allocator = Allocator::new();
         assert!(allocator.has_device(DEVICE_ID_0));
         assert!(!allocator.has_device(UNKNOWN_DEVICE_ID));
+    }
+
+    #[test]
+    fn pointer_accessors_allow_mutation() {
+        let mut allocator = Allocator::new();
+        let mut buffer = allocator
+            .allocate(BUFFER_SIZE, DEVICE_ID_0)
+            .expect("allocate gpu buffer");
+
+        unsafe {
+            *buffer.as_mut_ptr() = 0x5a;
+            assert_eq!(*buffer.as_ptr(), 0x5a);
+        }
+    }
+
+    #[test]
+    fn probe_respects_disable_env() {
+        {
+            let _guard = EnvGuard::set(ENV_DISABLE_VULKAN, "1");
+            assert!(Allocator::probe().is_none());
+        }
+        assert!(Allocator::probe().is_some());
     }
 }
