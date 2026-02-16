@@ -6,6 +6,7 @@ use crate::memory::allocator::InterprocessMemoryHandle;
 pub struct GpuMemoryBuffer {
     bytes: Vec<u8>,
     device_id: u32,
+    #[cfg_attr(not(any(test, windows)), allow(dead_code))]
     external_handle: InterprocessMemoryHandle,
 }
 
@@ -31,8 +32,9 @@ impl GpuMemoryBuffer {
     }
 
     /// Returns the exportable external handle.
-    pub fn external_handle(&self) -> InterprocessMemoryHandle {
-        self.external_handle
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn external_handle(&self) -> &InterprocessMemoryHandle {
+        &self.external_handle
     }
 }
 
@@ -41,12 +43,12 @@ impl GpuMemoryBuffer {
 /// This initial phase-2 implementation models the API and metadata flow while
 /// full Vulkan device memory integration is added incrementally.
 #[derive(Debug)]
-pub struct VulkanAllocator {
+pub struct Allocator {
     available_device_ids: Vec<u32>,
     next_handle_id: u64,
 }
 
-impl Default for VulkanAllocator {
+impl Default for Allocator {
     fn default() -> Self {
         Self {
             available_device_ids: vec![0],
@@ -55,7 +57,7 @@ impl Default for VulkanAllocator {
     }
 }
 
-impl VulkanAllocator {
+impl Allocator {
     /// Probes whether Vulkan allocation should be enabled for this process.
     ///
     /// This phase-2 scaffold allows disabling the GPU backend via
@@ -90,7 +92,7 @@ impl VulkanAllocator {
             return Err(LavaFlowError::GpuDeviceNotFound { device_id });
         }
 
-        let handle = InterprocessMemoryHandle::from_gpu_id(self.next_handle_id);
+        let handle = InterprocessMemoryHandle::from_gpu_id(self.next_handle_id)?;
         self.next_handle_id = self
             .next_handle_id
             .checked_add(1)
@@ -101,5 +103,71 @@ impl VulkanAllocator {
             device_id,
             external_handle: handle,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BUFFER_SIZE: usize = 64;
+    const DEVICE_ID_0: u32 = 0;
+    const UNKNOWN_DEVICE_ID: u32 = 99;
+
+    #[test]
+    fn allocate_returns_buffer_with_valid_handle() {
+        let mut allocator = Allocator::new();
+        let buffer = allocator
+            .allocate(BUFFER_SIZE, DEVICE_ID_0)
+            .expect("allocate gpu buffer");
+        assert_eq!(buffer.size(), BUFFER_SIZE);
+        assert_eq!(buffer.device_id(), DEVICE_ID_0);
+        assert!(buffer.external_handle().is_valid());
+        #[cfg(unix)]
+        assert!(matches!(
+            buffer.external_handle(),
+            &InterprocessMemoryHandle::GpuOpaqueFd(_)
+        ));
+        #[cfg(windows)]
+        assert!(matches!(
+            buffer.external_handle(),
+            &InterprocessMemoryHandle::GpuOpaqueWin32Handle(_)
+        ));
+    }
+
+    #[test]
+    fn allocate_rejects_zero_size() {
+        let mut allocator = Allocator::new();
+        let err = allocator
+            .allocate(0, DEVICE_ID_0)
+            .expect_err("zero-sized allocation must fail");
+        assert!(matches!(
+            err,
+            LavaFlowError::InvalidAllocationRequest {
+                size: 0,
+                reason: AllocationReason::ZeroSize,
+            }
+        ));
+    }
+
+    #[test]
+    fn allocate_rejects_unknown_device() {
+        let mut allocator = Allocator::new();
+        let err = allocator
+            .allocate(BUFFER_SIZE, UNKNOWN_DEVICE_ID)
+            .expect_err("unknown device must fail");
+        assert!(matches!(
+            err,
+            LavaFlowError::GpuDeviceNotFound {
+                device_id: UNKNOWN_DEVICE_ID
+            }
+        ));
+    }
+
+    #[test]
+    fn has_device_reports_visible_device() {
+        let allocator = Allocator::new();
+        assert!(allocator.has_device(DEVICE_ID_0));
+        assert!(!allocator.has_device(UNKNOWN_DEVICE_ID));
     }
 }

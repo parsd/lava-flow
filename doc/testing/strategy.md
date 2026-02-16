@@ -15,6 +15,22 @@ Linux/Windows, and performance monitoring that accounts for jitter and shared ru
 - Document expected behavior (tests as spec)
 - Enable parallel development (independent layer testing)
 
+## Review Checklist (Platform/Cfg Consistency)
+
+Use this checklist for refactors that touch platform code, conditional compilation, or test-only paths.
+
+- Verify all cfg slices compile:
+  - `#[cfg(test)]` and `#[cfg(not(test))]`
+  - `#[cfg(unix)]` and `#[cfg(windows)]`
+- Ensure symbols referenced in one cfg slice exist in that same slice.
+- Ensure mock/test adapters do not depend on non-test-only symbols.
+- Ensure production paths do not depend on `mod tests` / test helpers.
+- After renames, grep for leftovers (`old_name`, stale prefixes, old enum variants).
+- Run both platform suites for platform-sensitive changes:
+  - Windows: `cargo test --all-targets --all-features`
+  - Linux (WSL): `wsl.exe bash -lc "cd \"$(wslpath -a '$PWD')\" && cargo test --all-targets --all-features"`
+- When developing on Windows, include the WSL Linux test run before merging, even if Windows tests pass.
+
 ## Three-Tier Testing Model
 
 ### Tier 1: Unit Tests

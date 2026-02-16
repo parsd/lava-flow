@@ -30,6 +30,9 @@ pub enum AllocationReason {
     /// The requested size was zero.
     #[error("allocation size must be greater than zero")]
     ZeroSize,
+    /// The requested size exceeded the current allocation limit.
+    #[error("allocation size exceeds maximum supported size")]
+    ExceedsMaxSize,
 }
 
 /// Top-level error type for lava-flow core APIs.
@@ -82,6 +85,13 @@ pub enum LavaFlowError {
         device_id: u32,
     },
 
+    /// Interprocess handle kind is not supported for the requested operation.
+    #[error("unsupported interprocess handle for operation: {kind}")]
+    UnsupportedInterprocessHandle {
+        /// Handle kind string for diagnostics.
+        kind: &'static str,
+    },
+
     /// GPU allocation was requested but no GPU backend is available.
     #[error("GPU backend is not available")]
     GpuBackendUnavailable,
@@ -91,6 +101,16 @@ pub enum LavaFlowError {
     AllocatorStatePoisoned {
         /// Internal component that failed lock acquisition.
         component: &'static str,
+    },
+
+    /// OS shared-memory operation failed.
+    #[error("shared memory operation failed during {operation}")]
+    SharedMemoryOperation {
+        /// Shared-memory operation name.
+        operation: &'static str,
+        /// Source OS error.
+        #[source]
+        source: std::io::Error,
     },
 }
 

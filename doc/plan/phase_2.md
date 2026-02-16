@@ -8,7 +8,7 @@ NUMA support is deferred from the first implementation and treated as optional f
 ## Scope
 
 - Vulkan GPU memory allocation and external export
-- CPU allocation strategies (first implementation): standard, GPU-pinned
+- CPU allocation strategy (first implementation): standard
 - A single `MemoryAllocator` with explicit `MemoryLocation` requests and deterministic fallback
 - A unified interprocess handle type for GPU external memory and CPU shared memory
 - Parallel allocation support via thread-safe internal mutability in allocator backends
@@ -16,8 +16,8 @@ NUMA support is deferred from the first implementation and treated as optional f
 
 ## Applied Follow-up Learnings
 
-- CPU allocation cap is now explicit via `CpuAllocationConfig` and can be injected into
-  `MemoryAllocator::with_cpu_config(...)`.
+- CPU allocation cap is now owned by `CpuAllocator` and can be injected into
+  `MemoryAllocator::with_cpu_max_allocation_size(...)`.
 - CPU allocation logic is exposed as `CpuAllocator` to avoid implicit global configuration in tests and call sites.
 - `CpuMemoryBuffer` now supports safer slice-first access (`as_slice` / `as_mut_slice`) in addition to raw pointers.
 - Fault-injection paths used for coverage stay test-only; production paths do not branch on test hooks.
@@ -27,6 +27,8 @@ NUMA support is deferred from the first implementation and treated as optional f
   (`MemoryAllocator`, `CpuAllocator`) used by channel allocator implementations.
 - Channel allocators are expected to be fixed-target (`CPU` or `GPU`) by default; composition wrappers can add hybrid
   policies without forcing dual-branch logic into every allocator.
+- The default CPU allocator does not expose public pinned-allocation; specialized fast-transfer allocators are deferred
+  to later phases.
 
 ## Deliverables
 

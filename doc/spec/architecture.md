@@ -16,8 +16,8 @@ free.
 flowchart LR
   subgraph L1[Layer 1: Memory]
     MA[MemoryAllocator]
-    CPU[CpuAllocator]
-    GPU[VulkanAllocator]
+    CPU[cpu::Allocator]
+    GPU[gpu::Allocator]
   end
 
   subgraph L2[Layer 2: Channels]
@@ -103,7 +103,7 @@ In both cases metadata defines the valid payload region through `used_size`.
 
 Layer-2 channel allocators are fixed-target by default:
 
-- `CpuChannelAllocator` delivers `MemoryLocation::CpuHost { .. }`
+- `CpuChannelAllocator` delivers `MemoryLocation::CpuHost`
 - `GpuChannelAllocator` delivers `MemoryLocation::GpuVulkan { .. }`
 
 Composite/hybrid allocators may exist, but the base contract avoids mandatory dual CPU/GPU branching in every allocator

@@ -27,15 +27,9 @@ When trade-offs occur in Layer 1, use this priority order:
 
 ### CPU
 
-Implemented strategies:
-
-- `CpuAllocationStrategy::Standard`
-- `CpuAllocationStrategy::GpuPinned`
-
 Implemented API:
 
-- `CpuAllocationConfig` (explicit max allocation cap)
-- `CpuAllocator` (config-driven CPU allocation)
+- `CpuAllocator` (owns CPU allocation cap)
 - `CpuMemoryBuffer` with:
   - safe accessors: `as_slice`, `as_mut_slice`
   - raw pointer accessors: `as_ptr`, `as_mut_ptr`
@@ -43,7 +37,8 @@ Implemented API:
 
 Allocation cap behavior:
 
-- `CpuAllocationConfig::default()` reads `LAVA_FLOW_MAX_CPU_ALLOCATION_SIZE`
+- `cpu::Allocator::new()` reads `LAVA_FLOW_MAX_CPU_ALLOCATION_SIZE`
+- `cpu::Allocator::with_max_allocation_size(cap)` sets an explicit cap
 - invalid or zero env values fall back to platform hard cap
 - hard cap respects pointer/off_t limits
 
@@ -51,8 +46,8 @@ Allocation cap behavior:
 
 Implemented backend abstraction:
 
-- `VulkanAllocator` probe-based optional backend
-- `GpuMemoryBuffer` with external-handle metadata
+- `gpu::Allocator` probe-based optional backend
+- `gpu::MemoryBuffer` with external-handle metadata
 - `MemoryAllocator::new()` remains infallible; GPU backend may be unavailable at runtime
 
 ### Unified Allocator
@@ -60,21 +55,26 @@ Implemented backend abstraction:
 Implemented API:
 
 - `MemoryAllocator::new()`
-- `MemoryAllocator::with_cpu_config(cpu_config)`
+- `MemoryAllocator::with_cpu_max_allocation_size(cap)`
 - `allocate(size, location)`
 - `allocate_with_fallback(size, primary)`
 
 Implemented fallback behavior:
 
-- `GpuVulkan` -> `CpuHost { gpu_pinned: false }`
-- `CpuHost { gpu_pinned: true }` -> `CpuHost { gpu_pinned: false }`
-- `CpuHost { gpu_pinned: false }` -> no fallback
+- `GpuVulkan` -> `CpuHost`
+- `CpuHost` -> no fallback
+
+Pinned-memory note:
+
+- The default CPU allocator does not expose a public pinned-allocation option.
+- `AllocationStrategy` still indicates whether a buffer is pinned.
+- A dedicated fast-transfer allocator can be introduced later for backend-specific GPU transfer paths.
 
 ### Channel Integration Contract
 
 Layer 2 channel allocators should be fixed-target by default:
 
-- CPU-target allocators deliver `MemoryLocation::CpuHost { .. }`
+- CPU-target allocators deliver `MemoryLocation::CpuHost`
 - GPU-target allocators deliver `MemoryLocation::GpuVulkan { .. }`
 
 This keeps allocator implementations simple on platforms without GPU support and avoids mandatory dual-path
@@ -140,15 +140,14 @@ If added later:
 ```rust
 pub enum MemoryLocation {
     GpuVulkan { device_id: u32 },
-    CpuHost { gpu_pinned: bool },
+    CpuHost,
 }
 
-pub struct CpuAllocationConfig { /* max_allocation_size */ }
-pub struct CpuAllocator { /* config */ }
+pub struct CpuAllocator { /* max_allocation_size */ }
 
 impl MemoryAllocator {
     pub fn new() -> Self;
-    pub fn with_cpu_config(cpu_config: CpuAllocationConfig) -> Self;
+    pub fn with_cpu_max_allocation_size(cap: usize) -> Self;
     pub fn allocate(&self, size: usize, location: MemoryLocation) -> Result<MemoryBuffer>;
     pub fn allocate_with_fallback(&self, size: usize, primary: MemoryLocation) -> Result<MemoryBuffer>;
 }
