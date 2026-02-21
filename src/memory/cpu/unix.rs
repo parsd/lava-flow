@@ -1,6 +1,5 @@
 use super::*;
 
-#[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     ffi::CString,
@@ -148,10 +147,6 @@ impl SharedMemoryRegion {
     pub(super) fn export_handle(&self) -> Result<InterprocessMemoryHandle> {
         let owned_fd = SYSCALLS.dup_fd_cloexec(self.fd.as_raw_fd())?;
         Ok(InterprocessMemoryHandle::from_cpu_shared_handle(owned_fd))
-    }
-
-    pub(super) fn zero_fill(&mut self) {
-        unsafe { std::ptr::write_bytes(self.ptr, 0, self.len) };
     }
 }
 
@@ -337,6 +332,12 @@ mod tests {
         Allocator::with_max_allocation_size(usize::MAX).allocate(size)
     }
 
+    fn dup_stdout_fd_for_test() -> OwnedFd {
+        let dup_fd = unsafe { libc::dup(1) };
+        assert!(dup_fd >= 0, "dup stdout for test");
+        unsafe { OwnedFd::from_raw_fd(dup_fd) }
+    }
+
     #[test]
     fn open_shared_region_round_trip_shares_bytes() {
         let mut buffer = allocate_standard_for_test(BUFFER_SIZE).expect("allocate buffer");
@@ -411,9 +412,7 @@ mod tests {
 
     #[test]
     fn ftruncate_rejects_off_t_overflow_size() {
-        let dup_fd = unsafe { libc::dup(1) };
-        assert!(dup_fd >= 0, "dup stdout for test");
-        let dup_fd = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+        let dup_fd = dup_stdout_fd_for_test();
         let err = SYSCALLS
             .ftruncate(&dup_fd, usize::MAX)
             .expect_err("overflow must fail");
@@ -493,10 +492,12 @@ mod tests {
 
     #[test]
     fn drop_guard_returns_for_null_pointer() {
-        let mut region = SharedMemoryRegion::create(BUFFER_SIZE, hard_max_cpu_allocation_size())
-            .expect("create test region");
-        region.ptr = std::ptr::null_mut();
-        region.len = 1;
+        let fd = dup_stdout_fd_for_test();
+        let region = SharedMemoryRegion {
+            ptr: std::ptr::null_mut(),
+            len: 1,
+            fd,
+        };
         drop(region);
     }
 
@@ -529,9 +530,7 @@ mod tests {
 
     #[test]
     fn ftruncate_syscall_error_path() {
-        let dup_fd = unsafe { libc::dup(1) };
-        assert!(dup_fd >= 0, "dup stdout for test");
-        let dup_fd = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+        let dup_fd = dup_stdout_fd_for_test();
         let err = SYSCALLS
             .ftruncate(&dup_fd, BUFFER_SIZE)
             .expect_err("ftruncate should fail for stdout fd");
@@ -546,9 +545,7 @@ mod tests {
 
     #[test]
     fn mmap_syscall_error_path() {
-        let dup_fd = unsafe { libc::dup(1) };
-        assert!(dup_fd >= 0, "dup stdout for test");
-        let dup_fd = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+        let dup_fd = dup_stdout_fd_for_test();
         let err = SYSCALLS
             .mmap(&dup_fd, BUFFER_SIZE)
             .expect_err("mmap should fail for stdout fd");

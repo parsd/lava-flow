@@ -53,9 +53,10 @@ impl Allocator {
 
     /// Allocates standard host memory.
     pub fn allocate(&self, size: usize) -> Result<MemoryBuffer> {
-        let mut region = SharedMemoryRegion::create(size, self.max_allocation_size)?;
-        region.zero_fill();
-        Ok(MemoryBuffer { region })
+        let region = SharedMemoryRegion::create(size, self.max_allocation_size)?;
+        let mut buffer = MemoryBuffer { region };
+        buffer.zero_fill();
+        Ok(buffer)
     }
 
     /// Imports a CPU shared-memory handle into this process.
@@ -92,6 +93,10 @@ pub struct MemoryBuffer {
 }
 
 impl MemoryBuffer {
+    fn zero_fill(&mut self) {
+        unsafe { std::ptr::write_bytes(self.as_mut_ptr(), 0, self.size()) };
+    }
+
     /// Returns an immutable byte slice view over the whole allocation.
     pub fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.as_ptr(), self.size()) }

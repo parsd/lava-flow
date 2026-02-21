@@ -90,10 +90,6 @@ impl SharedMemoryRegion {
         let duplicated = SYSCALLS.duplicate_handle_same_access(self.mapping.as_raw_handle())?;
         Ok(InterprocessMemoryHandle::from_cpu_shared_handle(duplicated))
     }
-
-    pub(super) fn zero_fill(&mut self) {
-        unsafe { std::ptr::write_bytes(self.ptr, 0, self.len) };
-    }
 }
 
 impl Drop for SharedMemoryRegion {
@@ -386,10 +382,14 @@ mod tests {
 
     #[test]
     fn drop_guard_returns_for_null_pointer() {
-        let mut region = SharedMemoryRegion::create(BUFFER_SIZE, hard_max_cpu_allocation_size())
-            .expect("create test region");
-        region.ptr = std::ptr::null_mut();
-        region.len = 1;
+        let mapping = RealSyscalls
+            .create_file_mapping(SMALL_SIZE)
+            .expect("create test mapping");
+        let region = SharedMemoryRegion {
+            ptr: std::ptr::null_mut(),
+            len: 1,
+            mapping,
+        };
         drop(region);
     }
 
