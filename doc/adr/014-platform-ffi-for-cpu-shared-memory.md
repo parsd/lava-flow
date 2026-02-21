@@ -17,7 +17,6 @@ Phase 2 moved CPU allocation from demo-only `Vec<u8>` storage to real shared mem
 Rust std does not provide complete cross-platform APIs for:
 
 - creating named shared-memory objects / mapping them
-- pinning/locking pages for staging (`mlock`/`VirtualLock`)
 - exporting native handle types needed for interprocess transport semantics
 
 Without OS FFI bindings, the implementation cannot provide real shared-memory behavior.
