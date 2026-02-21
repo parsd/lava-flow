@@ -47,7 +47,7 @@ let tx = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone())
     .build()?;
 
 let rx = ChannelBuilder::receiver(my_loc, peer_loc)
-    .with_allocator(Arc::new(CpuChannelAllocator::new(cpu_allocator)))
+    .with_allocator(cpu_allocator)
     .with_metadata_encoding(MetadataEncoding::Cbor)
     .build()?;
 
@@ -103,8 +103,8 @@ In both cases metadata defines the valid payload region through `used_size`.
 
 Layer-2 channel allocators are fixed-target by default:
 
-- `CpuChannelAllocator` delivers `MemoryLocation::CpuHost`
-- `GpuChannelAllocator` delivers `MemoryLocation::GpuVulkan { .. }`
+- `cpu::Allocator` delivers `MemoryLocation::CpuHost`
+- `gpu::Allocator` delivers `MemoryLocation::GpuVulkan { .. }`
 
 Composite/hybrid allocators may exist, but the base contract avoids mandatory dual CPU/GPU branching in every allocator
 implementation.

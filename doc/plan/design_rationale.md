@@ -29,7 +29,7 @@ This document explains the "why" behind all architectural decisions.
 // Same code works optimally on laptop, single-node, or cluster
 let sender = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone()).build()?;
 let receiver = ChannelBuilder::receiver(my_loc, peer_loc)
-    .with_allocator(Arc::new(CpuChannelAllocator::new(cpu_allocator)))
+    .with_allocator(cpu_allocator)
     .build()?;
 // Local → Vulkan IPC (< 100 ns)
 // Remote → MPI (~ 10 us)
@@ -148,7 +148,7 @@ let buffer = allocator.allocate(...)?;  // Clear ownership
 let send_buffer = memory_allocator.allocate(size, MemoryLocation::GpuVulkan { device_id: 0 })?;
 let sender = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone()).build()?;
 let receiver = ChannelBuilder::receiver(my_loc, peer_loc)
-    .with_allocator(Arc::new(CpuChannelAllocator::new(cpu_allocator)))
+    .with_allocator(cpu_allocator)
     .build()?;
 // Channel decides receive materialization strategy based on transport + allocator config.
 ```

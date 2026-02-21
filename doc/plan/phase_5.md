@@ -24,7 +24,7 @@ workflow so sync is implicit for users.
 ```rust
 let tx = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone()).build()?;
 let rx = ChannelBuilder::receiver(my_loc, peer_loc)
-    .with_allocator(Arc::new(GpuChannelAllocator::new(gpu_allocator)))
+    .with_allocator(gpu_allocator)
     .build()?;
 
 tx.send(frame, &meta)?; // internally signals external semaphore

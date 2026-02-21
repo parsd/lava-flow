@@ -29,8 +29,8 @@ When trade-offs occur in Layer 1, use this priority order:
 
 Implemented API:
 
-- `CpuAllocator` (owns CPU allocation cap)
-- `CpuMemoryBuffer` with:
+- `cpu::Allocator` (owns CPU allocation cap)
+- `cpu::MemoryBuffer` with:
   - safe accessors: `as_slice`, `as_mut_slice`
   - raw pointer accessors: `as_ptr`, `as_mut_ptr`
   - `shared_handle()` export

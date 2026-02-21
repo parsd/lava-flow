@@ -26,9 +26,9 @@ Without OS FFI bindings, the implementation cannot provide real shared-memory be
 
 Add target-specific dependencies:
 
-- `libc` on Unix for `shm_open`, `ftruncate`, `mmap`, `mlock`, `munmap`, `munlock`
-- `windows-sys` on Windows for `CreateFileMappingW`, `MapViewOfFile`, `VirtualLock`,
-  `UnmapViewOfFile`, `VirtualUnlock`
+- `libc` on Unix for `shm_open`, `ftruncate`, `mmap`, `munmap`
+- `windows-sys` on Windows for `CreateFileMappingW`, `MapViewOfFile`, 
+  `UnmapViewOfFile`
 
 Keep these dependencies scoped to their platform targets in `Cargo.toml`.
 
@@ -58,11 +58,7 @@ integration), but it is unnecessary for the current shared-memory backend scope.
    - Risk: incorrect map/unmap or lock/unlock ordering.
    - Mitigation: RAII ownership in `SharedMemoryRegion` with `Drop` cleanup on all paths.
 
-2. **Low: Locked memory (`mlock`/`VirtualLock`) can increase memory pressure**
-   - Risk: overuse can reduce system stability under load.
-   - Mitigation: restricted to explicit `GpuPinned` path; regular CPU allocations remain unlocked.
-
-3. **Info: Dependency vulnerability scan clean at decision time**
+2. **Info: Dependency vulnerability scan clean at decision time**
    - `cargo audit` run on **2026-02-12** returned no vulnerabilities for this lockfile.
    - Command output summary:
      - `Loaded 919 security advisories`

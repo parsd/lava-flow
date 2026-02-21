@@ -52,6 +52,7 @@ trait Syscalls: Sync {
         let urandom = b"/dev/urandom\0";
         let fd = self.open(
             urandom.as_ptr().cast::<libc::c_char>(),
+            // O_CLOEXEC: prevent fd inheritance across exec so child processes cannot retain access.
             libc::O_RDONLY | libc::O_CLOEXEC,
         );
         if let Ok(fd) = fd {

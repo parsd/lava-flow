@@ -7,7 +7,7 @@ This document defines the channel API and transport behavior for local and remot
 - Distinct builders are used: `SenderBuilder` and `ReceiverBuilder`.
 - Distinct endpoints are used: `Sender` and `Receiver`.
 - `Frame` carries payload only; metadata is separate.
-- Receiver allocation policy is configured once at channel creation.
+- Receiver allocation policy is configured once at channel creation (default CPU).
 - Channel allocators are fixed-target (`CPU` or `GPU`) and allocation-only.
 - Receiver introspection is lightweight and stable: `scope()`, `receive_representation()`, and
   `configured_buffer_kind()`.
@@ -23,7 +23,7 @@ let tx = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone())
     .build()?;
 
 let rx = ChannelBuilder::receiver(my_loc, peer_loc)
-    .with_allocator(Arc::new(CpuChannelAllocator::new(cpu_allocator)))
+    .with_allocator(cpu_allocator)
     .with_metadata_encoding(MetadataEncoding::Cbor)
     .build()?;
 
@@ -86,7 +86,7 @@ impl Receiver {
     pub fn recv_map(&self) -> Result<(Frame, MessageMeta)>;
     pub fn scope(&self) -> CommunicationScope;
     pub fn receive_representation(&self) -> ReceiveRepresentation;
-    pub fn configured_buffer_kind(&self) -> Option<BufferKind>;
+    pub fn configured_buffer_kind(&self) -> BufferKind;
 }
 ```
 
@@ -112,15 +112,15 @@ pub trait ChannelAllocator: Send + Sync {
 
 Expected implementations:
 
-- `CpuChannelAllocator` (CPU target)
-- `GpuChannelAllocator` (GPU target)
-- Optional composite wrappers if needed
+- `cpu::Allocator` (CPU target)
+- `gpu::Allocator` (GPU target)
+- Optional composite wrappers if needed (e.g. in Cuda-adapter).
 
 Notes:
 
 - `local_receive_mode` is not part of allocator API.
 - Local receive behavior is channel runtime policy; allocator is used when materialization is needed.
-- Strategy details (ring/arena/hybrid/pinned) stay allocator-internal.
+- Memory strategy details (ring/arena/hybrid/pinned) stay allocator-internal.
 
 ## Transport Selection (Internal)
 
@@ -141,6 +141,7 @@ fn select_transport(scope: CommunicationScope, frame: &Frame) -> TransportKind {
 ## Why No `recv_into` In Core API
 
 - `recv_into` couples channel API to concrete buffer ownership details.
+- Conflicts with intra-node non-materialization policy (might require unnecessary alloc)
 - Ring/arena/hybrid reuse belongs in allocator strategy and can be implemented without expanding channel API.
 - Interop integrations (Torch/NumPy/etc.) are simpler with `Frame::External` / `Frame::Owned` envelopes.
 
