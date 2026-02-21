@@ -33,3 +33,8 @@ lava_flow_buffer_t* buf = lava_flow_alloc_gpu(ctx, 1000000);
 - [Rust FFI Guide](https://doc.rust-lang.org/nomicon/ffi.html)
 - [cbindgen](https://github.com/mozilla/cbindgen)
 - [pyo3](https://pyo3.rs/)
+
+## License Note
+
+- `cbindgen` (MPL-2.0) is used as a development/code-generation tool and is considered acceptable under the current
+  project license policy.

@@ -1,30 +1,61 @@
-# Phase 3: Vulkan IPC Channels
+# Phase 3: Local Channel Runtime
 
 ## TL;DR
 
-Implement Layer 2 for local communication: zero-copy Vulkan IPC channels with send/recv semantics. The public
-`Channel` API is shared with Phase 4; transport selection is internal.
+Implement Layer 2 for local communication with directional endpoints, payload-only frames, and separate metadata.
+Transport selection remains internal, and receive materialization behavior is configured once on the receiver endpoint.
 
 ## Scope
 
-- Channel API for local scope
+- Directional endpoint API for local scope (`Sender`, `Receiver`)
+- Distinct builders (`SenderBuilder`, `ReceiverBuilder`)
 - Vulkan IPC transport (external memory handles + shared metadata)
-- Frame metadata format
+- Local CPU shared-memory transport
+- Two receive variants:
+  - typed default: `recv::<M>() -> (Frame, M)`
+  - dynamic map: `recv_map() -> (Frame, MessageMeta)`
+- Receiver-owned allocation strategy (no per-recv target hints)
+- Lightweight endpoint introspection (`scope()`, `receive_representation()`, `configured_buffer_kind()`)
 - Local-only tests and benchmarks
 
 ## Deliverables
 
-- `Channel` API with send/recv and blocking helpers
+- `ChannelBuilder::sender(...)` and `ChannelBuilder::receiver(...)` returning distinct builders
+- `Sender` / `Receiver` endpoint types
+- `ChannelAllocator` trait with fixed-target allocation-only implementations
+- Payload envelope (`Frame::{External, Owned}`) without embedded metadata
+- Metadata contract (`ChannelMetadata` + `MessageMeta`) with mandatory `used_size`
+- Receiver-level `ReceiveRepresentation` (`ExternalShare`, `DirectTransfer`, `Materialized`)
+- Metadata serialization configuration (codec selection)
 - `VulkanIpcTransport`
-- Frame metadata serialization
-- Integration tests for local IPC
+- Local shared-memory transport integration
+- Integration tests for local IPC paths
 
 ## Example (API Shape)
 
 ```rust
-let channel = Channel::create(&allocator, &my_loc, &peer_loc)?;
-channel.send(frame)?;
-let received = channel.recv()?;
+let tx = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone())
+    .with_metadata_encoding(MetadataEncoding::Cbor)
+    .build()?;
+
+let rx = ChannelBuilder::receiver(my_loc, peer_loc)
+    .with_allocator(cpu_allocator)
+    .with_metadata_encoding(MetadataEncoding::Cbor)
+    .build()?;
+
+let frame = Frame::Owned(payload_buffer);
+let meta = ImageMeta {
+    used_size: payload_bytes,
+    width: 1920,
+    height: 1080,
+};
+
+tx.send(frame, &meta)?;
+let (frame, meta) = rx.recv::<ImageMeta>()?;
+let used = meta.used_size();
+
+let representation = rx.receive_representation();
+let target = rx.configured_buffer_kind();
 ```
 
 ## Related Docs

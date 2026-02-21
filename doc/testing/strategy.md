@@ -15,6 +15,22 @@ Linux/Windows, and performance monitoring that accounts for jitter and shared ru
 - Document expected behavior (tests as spec)
 - Enable parallel development (independent layer testing)
 
+## Review Checklist (Platform/Cfg Consistency)
+
+Use this checklist for refactors that touch platform code, conditional compilation, or test-only paths.
+
+- Verify all cfg slices compile:
+  - `#[cfg(test)]` and `#[cfg(not(test))]`
+  - `#[cfg(unix)]` and `#[cfg(windows)]`
+- Ensure symbols referenced in one cfg slice exist in that same slice.
+- Ensure mock/test adapters do not depend on non-test-only symbols.
+- Ensure production paths do not depend on `mod tests` / test helpers.
+- After renames, grep for leftovers (`old_name`, stale prefixes, old enum variants).
+- Run both platform suites for platform-sensitive changes:
+  - Windows: `cargo test --all-targets --all-features`
+  - Linux (WSL): `wsl.exe bash -lc "cd \"$(wslpath -a '$PWD')\" && cargo test --all-targets --all-features"`
+- When developing on Windows, include the WSL Linux test run before merging, even if Windows tests pass.
+
 ## Three-Tier Testing Model
 
 ### Tier 1: Unit Tests
@@ -62,9 +78,9 @@ fn test_scope_detection_different_host() {
 
 - GPU memory export/import (Vulkan IPC)
 - Channel creation and basic send/recv
-- NUMA allocation correctness
 - Hugepage allocation on Linux
 - CPU memory sharing between processes
+- Optional future: NUMA allocation correctness (when NUMA backend is implemented)
 
 **Location:** `tests/integration/`
 
@@ -102,7 +118,7 @@ fn test_channel_gpu_communication() {
         .spawn_pair()?;  // Custom helper
 
     // Producer (in separate process)
-    let buffer = allocator.allocate_auto(...)?;
+    let buffer = allocator.allocate(...)?;
     channel.send(buffer)?;
 
     // Consumer (in main process)
@@ -244,7 +260,7 @@ not strict pass/fail in CI unless running on stable, dedicated hardware.
 #[bench]
 fn bench_gpu_message_latency(b: &mut Bencher) {
     let allocator = MemoryAllocator::new();
-    let buffer = allocator.allocate_auto(...).expect("alloc");
+    let buffer = allocator.allocate(...).expect("alloc");
     let channel = Channel::new(&allocator, &my_loc, &peer_loc).expect("channel");
 
     b.iter(|| {
@@ -406,8 +422,8 @@ tests/
 +-- integration/                    # Tier 2: Integration tests
 |   +-- test_gpu_ipc.rs
 |   +-- test_channel_basic.rs
-|   +-- test_numa_allocation.rs
 |   +-- test_cpu_shared_memory.rs
+|   +-- test_numa_allocation.rs        # optional future (NUMA backend)
 |
 +-- e2e/                            # Tier 3: End-to-End Tests
 |   +-- test_mpi_communication.rs

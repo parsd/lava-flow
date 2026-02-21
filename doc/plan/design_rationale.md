@@ -27,7 +27,10 @@ This document explains the "why" behind all architectural decisions.
 
 ```rust
 // Same code works optimally on laptop, single-node, or cluster
-let channel = Channel::create(&allocator, &my_loc, &peer_loc)?;
+let sender = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone()).build()?;
+let receiver = ChannelBuilder::receiver(my_loc, peer_loc)
+    .with_allocator(cpu_allocator)
+    .build()?;
 // Local → Vulkan IPC (< 100 ns)
 // Remote → MPI (~ 10 us)
 ```
@@ -139,17 +142,15 @@ let allocator = MemoryAllocator::new(); // State in object
 let buffer = allocator.allocate(...)?;  // Clear ownership
 ```
 
-**Automatic CPU strategy:**
+**Explicit allocation strategy with channel-owned receive allocator:**
 
 ```rust
-// User doesn't need to know:
-// - Is this multi-socket? -> NUMA
-// - Is this remote? -> Hugepages
-// - Is GPU accessible? -> GPU-pinneo
-// Library detects automatically
-
-let buffer = allocator.allocate(size, &my_loc, &peer_loc)?;
-// Automatic: NUMA if multi-socket, hugepages if remote
+let send_buffer = memory_allocator.allocate(size, MemoryLocation::GpuVulkan { device_id: 0 })?;
+let sender = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone()).build()?;
+let receiver = ChannelBuilder::receiver(my_loc, peer_loc)
+    .with_allocator(cpu_allocator)
+    .build()?;
+// Channel decides receive materialization strategy based on transport + allocator config.
 ```
 
 **Related ADRs:**

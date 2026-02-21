@@ -1,4 +1,4 @@
-﻿# ADR-005: CPU Memory Allocation Strategies
+# ADR-005: CPU Memory Allocation Strategies
 
 **Status:** Accepted | **Date:** 2025-12-27 | **Supersedes:** None
 
@@ -129,7 +129,7 @@ unsafe {
 
 **Performance:** PCIe bandwidth (10-50 GB/s)
 
-**Use case:** CPU preprocessing → GPU inference
+**Use case:** CPU preprocessing -> GPU inference
 
 **Why needed:** Enables GPU direct access to CPU memory (no extra copy)
 
@@ -191,9 +191,9 @@ unsafe {
 pub fn select_cpu_strategy(
     buffer_size: usize,
     scope: CommunicationScope,
-    gpu_accessible: bool,
+    gpu_pinned: bool,
 ) -> CpuAllocationStrategy {
-    if gpu_accessible {
+    if gpu_pinned {
         return CpuAllocationStrategy::GpuPinned;
     }
 
@@ -212,7 +212,7 @@ pub fn select_cpu_strategy(
 
 ## Consequences
 
-- **10-20% faster** — Automatic selection picks optimal strategy
-- **No user configuration** — Works transparently
-- **Explicit override** — Advanced users can force strategy
-- **Platform differences** — Windows no hugepages (fallback to malloc)
+- **10-20% faster** - Automatic selection picks optimal strategy
+- **No user configuration** - Works transparently
+- **Explicit override** - Advanced users can force strategy
+- **Platform differences** - Windows no hugepages (fallback to malloc)

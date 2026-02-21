@@ -24,6 +24,17 @@ pub enum ValidationReason {
     InvalidCharacters,
 }
 
+/// Shared reasons for allocation request failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AllocationReason {
+    /// The requested size was zero.
+    #[error("allocation size must be greater than zero")]
+    ZeroSize,
+    /// The requested size exceeded the current allocation limit.
+    #[error("allocation size exceeds maximum supported size")]
+    ExceedsMaxSize,
+}
+
 /// Top-level error type for lava-flow core APIs.
 #[derive(Debug, Error)]
 pub enum LavaFlowError {
@@ -57,6 +68,50 @@ pub enum LavaFlowError {
     /// Hostname detection via OS APIs failed.
     #[error("failed to detect local hostname")]
     HostnameDetection(#[source] std::io::Error),
+
+    /// Memory allocation request failed validation.
+    #[error("invalid allocation request (size={size}): {reason}")]
+    InvalidAllocationRequest {
+        /// Requested allocation size in bytes.
+        size: usize,
+        /// Structured reason for rejection.
+        reason: AllocationReason,
+    },
+
+    /// A requested GPU device id is not known by the allocator.
+    #[error("GPU device `{device_id}` not found")]
+    GpuDeviceNotFound {
+        /// Requested device id.
+        device_id: u32,
+    },
+
+    /// Interprocess handle kind is not supported for the requested operation.
+    #[error("unsupported interprocess handle for operation: {kind}")]
+    UnsupportedInterprocessHandle {
+        /// Handle kind string for diagnostics.
+        kind: &'static str,
+    },
+
+    /// GPU allocation was requested but no GPU backend is available.
+    #[error("GPU backend is not available")]
+    GpuBackendUnavailable,
+
+    /// Internal allocator state lock was poisoned by a prior panic.
+    #[error("allocator state lock poisoned: {component}")]
+    AllocatorStatePoisoned {
+        /// Internal component that failed lock acquisition.
+        component: &'static str,
+    },
+
+    /// OS shared-memory operation failed.
+    #[error("shared memory operation failed during {operation}")]
+    SharedMemoryOperation {
+        /// Shared-memory operation name.
+        operation: &'static str,
+        /// Source OS error.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Standard result type for lava-flow APIs.
