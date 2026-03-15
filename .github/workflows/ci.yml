@@ -43,6 +43,20 @@ jobs:
           install_lavapipe: ${{ matrix.install_lavapipe }}
           install_swiftshader: ${{ matrix.install_swiftshader }}
 
+      - name: Vulkan diagnostics (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo "VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-<unset>}"
+          echo "VK_LAYER_PATH=${VK_LAYER_PATH:-<unset>}"
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<unset>}"
+          echo "XDG_DATA_DIRS=${XDG_DATA_DIRS:-<unset>}"
+          command -v vulkaninfo || true
+          vulkaninfo --summary || vulkaninfo || true
+          ls -la /usr/share/vulkan || true
+          find /usr/share/vulkan -maxdepth 2 -type f | sort || true
+          ls -la /etc/vulkan || true
+          find /etc/vulkan -maxdepth 2 -type f | sort || true
+
       - name: Format
         run: cargo fmt --all -- --check
 
@@ -248,5 +262,3 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-
-
