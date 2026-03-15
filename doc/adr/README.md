@@ -28,3 +28,5 @@ When to references ADRs:
 | [013](013-hostname-library.md) | Hostname Library for Host Identity | Accepted | Scope detection reliability |
 | [014](014-platform-ffi-for-cpu-shared-memory.md) | Platform FFI Dependencies for CPU Shared Memory | Accepted | Layer 1 CPU shared memory backend |
 | [015](015-rust-vulkan-binding-library.md) | Rust Vulkan Binding Library Selection | Accepted | Layer 1 GPU implementation dependency |
+| [016](016-github-actions-third-party-action-pinning.md) | GitHub Actions Third-Party Action Pinning | Accepted | CI dependency immutability |
+| [017](017-github-actions-vulkan-ci-setup.md) | GitHub Actions Vulkan CI Setup | Accepted | CI software Vulkan enablement on hosted runners |

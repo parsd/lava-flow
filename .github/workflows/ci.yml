@@ -22,20 +22,33 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-24.04
+            install_lavapipe: true
+            install_swiftshader: false
+          - os: windows-2025
+            install_lavapipe: false
+            install_swiftshader: true
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Install Vulkan SDK and software rasterizer
+        uses: jakoch/install-vulkan-sdk-action@06218f81a3cbd7dce502fdc666c8db2af725b442 # v1.4.0
+        with:
+          cache: true
+          install_lavapipe: ${{ matrix.install_lavapipe }}
+          install_swiftshader: ${{ matrix.install_swiftshader }}
 
       - name: Format
         run: cargo fmt --all -- --check
 
       - name: Clippy annotations
         if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions-rs/clippy-check@v1
+        uses: actions-rs/clippy-check@eaad5cbab12213484acb251837981a39c27de18d # v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           args: --workspace --all-features -- -D warnings
@@ -52,10 +65,10 @@ jobs:
     needs: lint_test
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov
