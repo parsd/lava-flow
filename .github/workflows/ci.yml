@@ -49,20 +49,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
 
-      - name: Vulkan diagnostics (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          echo "VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-<unset>}"
-          echo "VK_LAYER_PATH=${VK_LAYER_PATH:-<unset>}"
-          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<unset>}"
-          echo "XDG_DATA_DIRS=${XDG_DATA_DIRS:-<unset>}"
-          command -v vulkaninfo || true
-          vulkaninfo --summary || vulkaninfo || true
-          ls -la /usr/share/vulkan || true
-          find /usr/share/vulkan -maxdepth 2 -type f | sort || true
-          ls -la /etc/vulkan || true
-          find /etc/vulkan -maxdepth 2 -type f | sort || true
-
       - name: Format
         run: cargo fmt --all -- --check
 
@@ -92,6 +78,11 @@ jobs:
 
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov
+
+      - name: Install Mesa Vulkan drivers (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
 
       - name: Coverage (workspace)
         run: cargo llvm-cov --workspace --all-features --html
