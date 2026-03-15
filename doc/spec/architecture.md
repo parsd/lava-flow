@@ -15,7 +15,6 @@ free.
 ```mermaid
 flowchart LR
   subgraph L1[Layer 1: Memory]
-    MA[MemoryAllocator]
     CPU[cpu::Allocator]
     GPU[gpu::Allocator]
   end
@@ -28,11 +27,10 @@ flowchart LR
     TR[Transport Selection]
   end
 
-  MA --> CPU
-  MA --> GPU
   SB --> TX
   RB --> RX
-  RX --> MA
+  RX --> CPU
+  RX --> GPU
   TX --> TR
   RX --> TR
 ```
@@ -103,8 +101,8 @@ In both cases metadata defines the valid payload region through `used_size`.
 
 Layer-2 channel allocators are fixed-target by default:
 
-- `cpu::Allocator` delivers `MemoryLocation::CpuHost`
-- `gpu::Allocator` delivers `MemoryLocation::GpuVulkan { .. }`
+- `cpu::Allocator` delivers CPU-backed payload buffers
+- `gpu::Allocator` delivers GPU-backed payload buffers
 
 Composite/hybrid allocators may exist, but the base contract avoids mandatory dual CPU/GPU branching in every allocator
 implementation.

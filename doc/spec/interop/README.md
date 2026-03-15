@@ -44,23 +44,14 @@ flowchart TD
 
 ## Minimal Workflow (Example-Only)
 
-### 1. Allocate with lava-flow (Rust)
+### 1. Allocate with lava-flow (Rust, illustrative)
 
 ```rust
-use lava_flow::{MemoryAllocator, MemoryLocation};
+use lava_flow::gpu;
 
-let mut allocator = MemoryAllocator::new()?;
-let buffer = allocator.allocate(
-    1_000_000,  // 1 MB
-    MemoryLocation::GpuVulkan { device_id: 0 }
-)?;
-
-// Export external memory handle
-#[cfg(target_os = "linux")]
-let handle = buffer.export_fd()?;  // File descriptor
-
-#[cfg(target_os = "windows")]
-let handle = buffer.export_handle()?;  // HANDLE
+let mut allocator = gpu::Allocator::new_for_device(0)?;
+let buffer = allocator.allocate(1_000_000)?; // 1 MB
+// Transport/interoperability layers export the platform external handle.
 ```
 
 ### 2. Import in a target API (Linux examples)

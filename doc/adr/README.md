@@ -27,3 +27,4 @@ When to references ADRs:
 | [012](012-serde-serialization.md) | Serde for Data Serialization | Accepted | Type serialization |
 | [013](013-hostname-library.md) | Hostname Library for Host Identity | Accepted | Scope detection reliability |
 | [014](014-platform-ffi-for-cpu-shared-memory.md) | Platform FFI Dependencies for CPU Shared Memory | Accepted | Layer 1 CPU shared memory backend |
+| [015](015-rust-vulkan-binding-library.md) | Rust Vulkan Binding Library Selection | Accepted | Layer 1 GPU implementation dependency |

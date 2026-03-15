@@ -139,14 +139,14 @@ impl SharedMemoryRegion {
         self.ptr
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub(super) fn size(&self) -> usize {
         self.len
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn export_handle(&self) -> Result<InterprocessMemoryHandle> {
         let owned_fd = SYSCALLS.dup_fd_cloexec(self.fd.as_raw_fd())?;
-        Ok(InterprocessMemoryHandle::from_cpu_shared_handle(owned_fd))
+        Ok(InterprocessMemoryHandle::from_cpu_shared_fd(owned_fd))
     }
 }
 
@@ -338,6 +338,14 @@ mod tests {
         unsafe { OwnedFd::from_raw_fd(dup_fd) }
     }
 
+    fn gpu_external_fd_for_test() -> OwnedFd {
+        let mut fds = [0; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "create pipe for gpu handle");
+        let _read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        unsafe { OwnedFd::from_raw_fd(fds[1]) }
+    }
+
     #[test]
     fn open_shared_region_round_trip_shares_bytes() {
         let mut buffer = allocate_standard_for_test(BUFFER_SIZE).expect("allocate buffer");
@@ -355,7 +363,7 @@ mod tests {
 
     #[test]
     fn open_shared_region_rejects_gpu_handle() {
-        let gpu_handle = InterprocessMemoryHandle::from_gpu_id(1).expect("create gpu handle");
+        let gpu_handle = InterprocessMemoryHandle::from_gpu_external_fd(gpu_external_fd_for_test());
         let err = SharedMemoryRegion::from_handle(
             BUFFER_SIZE,
             hard_max_cpu_allocation_size(),

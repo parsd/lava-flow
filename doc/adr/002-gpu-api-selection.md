@@ -313,17 +313,14 @@ glNamedBufferStorageMemEXT(buffer, size, mem_obj, 0);
 ```rust
 #[test]
 fn test_vulkan_device_available() {
-    let allocator = MemoryAllocator::new();
-    assert!(allocator.has_vulkan_device());
+    let _allocator = lava_flow::gpu::Allocator::new_for_device(0)
+        .expect("vulkan allocator should initialize");
 }
 
 #[test]
 fn test_gpu_memory_allocation() {
-    let allocator = MemoryAllocator::new();
-    let buffer = allocator.allocate(
-        1_000_000,
-        MemoryLocation::GpuVulkan { device_id: 0 }
-    ).expect("allocate GPU memory");
+    let mut allocator = lava_flow::gpu::Allocator::new_for_device(0).expect("allocator");
+    let buffer = allocator.allocate(1_000_000).expect("allocate GPU memory");
     assert_eq!(buffer.size(), 1_000_000);
 }
 

@@ -90,20 +90,17 @@ fn test_scope_detection_different_host() {
 #[test]
 fn test_gpu_memory_export_import() {
     // 1. Process A allocates GPU memory
-    let allocator = MemoryAllocator::new();
-    let gpu_buffer = allocator.allocate(
-        1_000_000,
-        MemoryLocation::GpuVulkan { device_id: 0 }
-    ).expect("allocate GPU");
+    let mut allocator = lava_flow::gpu::Allocator::new_for_device(0).expect("allocator");
+    let gpu_buffer = allocator.allocate(1_000_000).expect("allocate GPU");
 
-    // 2. Export handle
-    let handle = gpu_buffer.export_handle().expect("export");
+    // 2. Export transport metadata/handle (channel-layer API)
+    let handle = export_handle_metadata(&gpu_buffer).expect("export");
 
     // 3. Process B imports (simulate via fork or spawn)
     let imported = MemoryBuffer::import(handle).expect("import");
 
-    // 4. Verify same memory
-    assert_eq!(gpu_buffer.as_ptr(), imported.as_ptr());
+    // 4. Verify imported metadata and size
+    assert_eq!(gpu_buffer.size(), imported.size());
 }
 ```
 
@@ -259,9 +256,9 @@ not strict pass/fail in CI unless running on stable, dedicated hardware.
 ```rust
 #[bench]
 fn bench_gpu_message_latency(b: &mut Bencher) {
-    let allocator = MemoryAllocator::new();
+    let mut allocator = lava_flow::gpu::Allocator::new_for_device(0).expect("allocator");
     let buffer = allocator.allocate(...).expect("alloc");
-    let channel = Channel::new(&allocator, &my_loc, &peer_loc).expect("channel");
+    let channel = Channel::new(&my_loc, &peer_loc).expect("channel");
 
     b.iter(|| {
         channel.send(&buffer).expect("send");
@@ -288,10 +285,7 @@ fn bench_gpu_message_latency(b: &mut Bencher) {
 #[bench]
 fn bench_gpu_throughput(b: &mut Bencher) {
     let buffer_size = 1_000_000_000; // 1 GB
-    let buffer = allocator.allocate(
-        buffer_size,
-        MemoryLocation::GpuVulkan { device_id: 0 }
-    )?;
+    let buffer = allocator.allocate(buffer_size)?;
 
     b.iter(|| {
         channel.send(&buffer).expect("send");

@@ -31,7 +31,7 @@ cudaMalloc(&ptr, size);  // Uses set device
 **lava-flow approach:**
 
 ```rust
-let allocator = MemoryAllocator::new();
+let mut allocator = lava_flow::gpu::Allocator::new_for_device(0)?;
 let buffer = allocator.allocate(...)?;
 // State explicit, no global confusion
 ```
@@ -39,16 +39,14 @@ let buffer = allocator.allocate(...)?;
 ## Implementation
 
 ```rust
-pub struct MemoryAllocator {
-    devices: Vec<VulkanDevice>,
-    numa_nodes: Vec<NumaNode>,
+pub struct Allocator {
+    max_allocation_size: usize,
 }
 
-impl MemoryAllocator {
-    pub fn new() -> Result<Self, Error> { ... }
+impl Allocator {
+    pub fn new() -> Self { ... }
 
-    pub fn allocate(&mut self, size: usize, location: MemoryLocation)
-        -> Result<Box<dyn MemoryBuffer>, Error> {
+    pub fn allocate(&self, size: usize) -> Result<MemoryBuffer, Error> {
         // All state in self, no globals
     }
 }

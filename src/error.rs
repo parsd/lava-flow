@@ -96,6 +96,15 @@ pub enum LavaFlowError {
     #[error("GPU backend is not available")]
     GpuBackendUnavailable,
 
+    /// Vulkan backend operation failed.
+    #[error("vulkan operation failed during {operation}: {details}")]
+    VulkanOperation {
+        /// Vulkan operation name.
+        operation: &'static str,
+        /// Human-readable details, typically a Vulkan result code.
+        details: String,
+    },
+
     /// Internal allocator state lock was poisoned by a prior panic.
     #[error("allocator state lock poisoned: {component}")]
     AllocatorStatePoisoned {

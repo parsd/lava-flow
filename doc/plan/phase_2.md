@@ -2,29 +2,28 @@
 
 ## TL;DR
 
-Implement Layer 1: a unified allocator for Vulkan GPU memory and core CPU strategies, with explicit location requests.
+Implement Layer 1: backend-specific allocators for Vulkan GPU memory and CPU strategies.
 NUMA support is deferred from the first implementation and treated as optional future work.
 
 ## Scope
 
 - Vulkan GPU memory allocation and external export
 - CPU allocation strategy (first implementation): standard
-- A single `MemoryAllocator` with explicit `MemoryLocation` requests and deterministic fallback
+- Split allocators (`cpu::Allocator`, `gpu::Allocator`)
 - A unified interprocess handle type for GPU external memory and CPU shared memory
 - Parallel allocation support via thread-safe internal mutability in allocator backends
 - Optional future extension: NUMA-aware CPU allocation
 
 ## Applied Follow-up Learnings
 
-- CPU allocation cap is now owned by `CpuAllocator` and can be injected into
-  `MemoryAllocator::with_cpu_max_allocation_size(...)`.
+- CPU allocation cap is owned by `cpu::Allocator`.
 - CPU allocation logic is exposed as `CpuAllocator` to avoid implicit global configuration in tests and call sites.
 - `CpuMemoryBuffer` now supports safer slice-first access (`as_slice` / `as_mut_slice`) in addition to raw pointers.
 - Fault-injection paths used for coverage stay test-only; production paths do not branch on test hooks.
 - Platform-specific implementation code should be split by OS (`mod.rs` + `unix.rs` + `windows.rs`) when complexity
   goes beyond trivial wrappers.
-- Layer 2 receive materialization is channel-owned and allocator-driven; Phase 2 provides the allocation primitives
-  (`MemoryAllocator`, `CpuAllocator`) used by channel allocator implementations.
+- Layer 2 receive materialization is channel-owned and allocator-driven; Phase 2 provides allocation primitives
+  (`cpu::Allocator`, `gpu::Allocator`) used by channel allocator implementations.
 - Channel allocators are expected to be fixed-target (`CPU` or `GPU`) by default; composition wrappers can add hybrid
   policies without forcing dual-branch logic into every allocator.
 - The default CPU allocator does not expose public pinned-allocation; specialized fast-transfer allocators are deferred
@@ -32,7 +31,7 @@ NUMA support is deferred from the first implementation and treated as optional f
 
 ## Deliverables
 
-- `MemoryAllocator` with GPU + CPU backends
+- `cpu::Allocator` and `gpu::Allocator`
 - Interprocess handle export (GPU external + CPU shared-memory handle variants)
 - Deterministic fallback logic
 - Integration tests for allocation and export/import
@@ -41,15 +40,9 @@ NUMA support is deferred from the first implementation and treated as optional f
 ## Example (API Shape)
 
 ```rust
-use lava_flow::{InterprocessMemoryHandle, MemoryAllocator, MemoryLocation};
-
-let allocator = MemoryAllocator::new();
-let buffer = allocator.allocate(
-    1_000_000,
-    MemoryLocation::GpuVulkan { device_id: 0 }
-)?;
-
-let handle: InterprocessMemoryHandle = buffer.export_handle()?;
+let mut allocator = lava_flow::gpu::Allocator::new_for_device(0)?;
+let buffer = allocator.allocate(1_000_000)?;
+// Channel layer exports/imports transport handle metadata.
 ```
 
 ## Related Docs

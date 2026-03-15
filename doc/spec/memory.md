@@ -4,14 +4,14 @@ This document specifies the current Layer-1 memory implementation for lava-flow.
 
 ## Scope
 
-Layer 1 provides a unified allocation API across:
+Layer 1 provides allocation APIs across:
 
 - GPU memory (Vulkan-oriented backend abstraction)
 - CPU memory (host shared-memory backend)
 - Unified memory metadata/handle export for channel transports
 - Allocator building blocks for channel-owned receive materialization strategies
 
-Channels (Layer 2) consume `MemoryBuffer` regardless of backing type.
+Channels (Layer 2) consume memory buffers regardless of backing type.
 Layer 2 channels may also consume/export external references and decide materialization through channel allocator
 configuration.
 
@@ -46,23 +46,24 @@ Allocation cap behavior:
 
 Implemented backend abstraction:
 
-- `gpu::Allocator` probe-based optional backend
-- `gpu::MemoryBuffer` with external-handle metadata
-- `MemoryAllocator::new()` remains infallible; GPU backend may be unavailable at runtime
+- `gpu::Allocator` with strict backend invariant (`new() -> Result<Self>`)
+- `gpu::Allocator::new_for_device(device_id)` for explicit logical device selection
+- each allocator is device-scoped and `allocate(size)` uses its configured device id
+- `gpu::MemoryBuffer` with:
+  - logical `size()` (payload bytes)
+  - `allocation_size()` (Vulkan-required backing bytes)
+  - external-handle metadata
+- GPU allocator construction fails when backend is unavailable/disabled
+- GPU allocation path does not expose host-mapped pointer access in the public API
 
-### Unified Allocator
+### Allocator Composition
 
-Implemented API:
+Implemented API is split by backend:
 
-- `MemoryAllocator::new()`
-- `MemoryAllocator::with_cpu_max_allocation_size(cap)`
-- `allocate(size, location)`
-- `allocate_with_fallback(size, primary)`
+- `cpu::Allocator`
+- `gpu::Allocator`
 
-Implemented fallback behavior:
-
-- `GpuVulkan` -> `CpuHost`
-- `CpuHost` -> no fallback
+Selection/composition across CPU/GPU is a Layer-2 channel concern.
 
 Pinned-memory note:
 
@@ -74,8 +75,8 @@ Pinned-memory note:
 
 Layer 2 channel allocators should be fixed-target by default:
 
-- CPU-target allocators deliver `MemoryLocation::CpuHost`
-- GPU-target allocators deliver `MemoryLocation::GpuVulkan { .. }`
+- CPU-target allocators deliver CPU-backed payload buffers
+- GPU-target allocators deliver GPU-backed payload buffers
 
 This keeps allocator implementations simple on platforms without GPU support and avoids mandatory dual-path
 `CPU/GPU` error branching in every allocator implementation.
@@ -87,6 +88,8 @@ Allocator contract is allocation-only for receive materialization paths:
 
 If a deployment needs hybrid behavior, composition wrappers can combine fixed-target allocators without changing the
 base Layer-1 allocator contracts.
+Planned Layer-2 channel integration should continue through traits/builders and should not introduce a separate
+`src/memory/unified.rs` abstraction layer.
 
 ## Interprocess Handles
 
@@ -99,7 +102,7 @@ Variants:
 - Unix: `GpuOpaqueFd`, `CpuSharedFd`
 - Windows: `GpuOpaqueWin32Handle`, `CpuSharedWin32Handle`
 
-`MemoryBuffer::export_handle()` behavior:
+Handle export behavior:
 
 - GPU buffer: exports GPU external handle metadata
 - CPU buffer: exports CPU shared-memory transport handle
@@ -127,7 +130,7 @@ The following are intentionally deferred and not part of current Layer-1 behavio
 
 - NUMA-aware CPU allocation strategy
 - Hugepage allocation strategy
-- Full Vulkan device-memory implementation details (current code models API and handle flow)
+- Advanced Vulkan policies (memory-type policy tuning and queue-family strategy)
 
 If added later:
 
@@ -138,18 +141,12 @@ If added later:
 ## Minimal API Shape (Current)
 
 ```rust
-pub enum MemoryLocation {
-    GpuVulkan { device_id: u32 },
-    CpuHost,
+pub mod cpu {
+    pub struct Allocator { /* max_allocation_size */ }
 }
 
-pub struct CpuAllocator { /* max_allocation_size */ }
-
-impl MemoryAllocator {
-    pub fn new() -> Self;
-    pub fn with_cpu_max_allocation_size(cap: usize) -> Self;
-    pub fn allocate(&self, size: usize, location: MemoryLocation) -> Result<MemoryBuffer>;
-    pub fn allocate_with_fallback(&self, size: usize, primary: MemoryLocation) -> Result<MemoryBuffer>;
+pub mod gpu {
+    pub struct Allocator { /* device_id/runtime */ }
 }
 ```
 

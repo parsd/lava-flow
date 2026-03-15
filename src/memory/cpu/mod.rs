@@ -13,7 +13,7 @@ use unix::SharedMemoryRegion;
 use windows::SharedMemoryRegion;
 
 /// Stateless API wrapper around CPU memory allocation strategies.
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 pub struct Allocator {
     max_allocation_size: usize,
 }
@@ -119,7 +119,7 @@ impl MemoryBuffer {
 
     /// Returns the buffer size in bytes.
     pub fn size(&self) -> usize {
-        self.region.len()
+        self.region.size()
     }
 
     /// Returns the allocation strategy used to create this buffer.

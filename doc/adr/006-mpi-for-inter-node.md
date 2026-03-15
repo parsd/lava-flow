@@ -50,11 +50,11 @@ pub struct MpiChannel {
 }
 
 impl MpiChannel {
-    pub fn send(&mut self, buffer: &[u8]) -> Result<()> {
+    pub fn send(&mut self, payload: &[u8]) -> Result<()> {
         unsafe {
             MPI_Send(
-                buffer.as_ptr() as *const c_void,
-                buffer.len() as c_int,
+                payload.as_ptr() as *const c_void,
+                payload.len() as c_int,
                 MPI_BYTE,
                 self.peer_rank,
                 self.tag,
@@ -64,11 +64,11 @@ impl MpiChannel {
         Ok(())
     }
 
-    pub fn recv(&mut self, buffer: &mut [u8]) -> Result<()> {
+    pub fn recv(&mut self, payload: &mut [u8]) -> Result<()> {
         unsafe {
             MPI_Recv(
-                buffer.as_mut_ptr() as *mut c_void,
-                buffer.len() as c_int,
+                payload.as_mut_ptr() as *mut c_void,
+                payload.len() as c_int,
                 MPI_BYTE,
                 self.peer_rank,
                 self.tag,

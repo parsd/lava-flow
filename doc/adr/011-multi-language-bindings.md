@@ -27,8 +27,8 @@ These are independent concerns:
 **Rust core (Phase 1-5):**
 
 ```rust
-pub struct MemoryAllocator { ... }
-impl MemoryAllocator {
+pub struct Allocator { ... }
+impl Allocator {
     pub fn allocate(...) -> Result<Buffer, Error> { ... }
 }
 ```

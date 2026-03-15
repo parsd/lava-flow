@@ -9,6 +9,7 @@ Transport selection remains internal, and receive materialization behavior is co
 
 - Directional endpoint API for local scope (`Sender`, `Receiver`)
 - Distinct builders (`SenderBuilder`, `ReceiverBuilder`)
+- Trait-based channel allocator integration over concrete Layer-1 allocator backends
 - Vulkan IPC transport (external memory handles + shared metadata)
 - Local CPU shared-memory transport
 - Two receive variants:
@@ -23,6 +24,7 @@ Transport selection remains internal, and receive materialization behavior is co
 - `ChannelBuilder::sender(...)` and `ChannelBuilder::receiver(...)` returning distinct builders
 - `Sender` / `Receiver` endpoint types
 - `ChannelAllocator` trait with fixed-target allocation-only implementations
+- No `src/memory/unified.rs` planning; allocator composition stays in traits/builders and existing module boundaries
 - Payload envelope (`Frame::{External, Owned}`) without embedded metadata
 - Metadata contract (`ChannelMetadata` + `MessageMeta`) with mandatory `used_size`
 - Receiver-level `ReceiveRepresentation` (`ExternalShare`, `DirectTransfer`, `Materialized`)

@@ -24,22 +24,14 @@ Linux, HANDLE on Windows). This document is example-only; refer to Khronos for f
 
 ## Minimal Example
 
-### Rust (lava-flow allocation)
+### Rust (lava-flow allocation, illustrative)
 
 ```rust
-use lava_flow::{MemoryAllocator, MemoryLocation};
+use lava_flow::gpu;
 
-let mut allocator = MemoryAllocator::new()?;
-let buffer = allocator.allocate(
-    1_000_000,
-    MemoryLocation::GpuVulkan { device_id: 0 }
-)?;
-
-#[cfg(target_os = "linux")]
-let handle = buffer.export_fd()?;
-
-#[cfg(target_os = "windows")]
-let handle = buffer.export_handle()?;
+let mut allocator = gpu::Allocator::new_for_device(0)?;
+let buffer = allocator.allocate(1_000_000)?;
+// External handle export is performed by interop/channel layer APIs.
 ```
 
 ### OpenCL (Linux import)

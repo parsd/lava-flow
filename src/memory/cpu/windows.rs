@@ -80,7 +80,7 @@ impl SharedMemoryRegion {
         self.ptr
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub(super) fn size(&self) -> usize {
         self.len
     }
 
@@ -195,6 +195,28 @@ mod tests {
         f()
     }
 
+    fn gpu_external_handle_for_test() -> OwnedHandle {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let current = unsafe { GetCurrentProcess() };
+        let mut duplicated = std::ptr::null_mut();
+        let ok = unsafe {
+            DuplicateHandle(
+                current,
+                current,
+                current,
+                &mut duplicated,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        assert_ne!(ok, 0, "duplicate current process handle");
+        unsafe { OwnedHandle::from_raw_handle(duplicated) }
+    }
+
     fn cpu_raw_handle(handle: &InterprocessMemoryHandle) -> RawHandle {
         match handle {
             InterprocessMemoryHandle::CpuSharedWin32Handle(owned) => owned.as_raw_handle(),
@@ -253,7 +275,8 @@ mod tests {
 
     #[test]
     fn open_shared_region_rejects_gpu_handle() {
-        let gpu_handle = InterprocessMemoryHandle::from_gpu_id(1).expect("create gpu handle");
+        let gpu_handle =
+            InterprocessMemoryHandle::from_gpu_external_handle(gpu_external_handle_for_test());
         let err = SharedMemoryRegion::from_handle(
             BUFFER_SIZE,
             hard_max_cpu_allocation_size(),
@@ -304,7 +327,8 @@ mod tests {
 
     #[test]
     fn cpu_handle_match_panics_for_gpu_handle_branch() {
-        let handle = InterprocessMemoryHandle::from_gpu_id(1).expect("create gpu handle");
+        let handle =
+            InterprocessMemoryHandle::from_gpu_external_handle(gpu_external_handle_for_test());
         let result = std::panic::catch_unwind(|| cpu_raw_handle(&handle));
         assert!(result.is_err(), "gpu handle branch should panic");
     }

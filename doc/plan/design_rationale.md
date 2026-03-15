@@ -138,14 +138,15 @@ hugepages.
 cudaSetDevice(0);  // Which device now? hard to track.
 
 // lava-flow style (explicit):
-let allocator = MemoryAllocator::new(); // State in object
+let mut allocator = lava_flow::gpu::Allocator::new_for_device(0)?; // State in object
 let buffer = allocator.allocate(...)?;  // Clear ownership
 ```
 
 **Explicit allocation strategy with channel-owned receive allocator:**
 
 ```rust
-let send_buffer = memory_allocator.allocate(size, MemoryLocation::GpuVulkan { device_id: 0 })?;
+let mut send_allocator = lava_flow::gpu::Allocator::new_for_device(0)?;
+let send_buffer = send_allocator.allocate(size)?;
 let sender = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone()).build()?;
 let receiver = ChannelBuilder::receiver(my_loc, peer_loc)
     .with_allocator(cpu_allocator)

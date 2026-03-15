@@ -1,22 +1,13 @@
 use super::InterprocessMemoryHandle;
-use crate::error::{LavaFlowError, Result};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 
 impl InterprocessMemoryHandle {
-    pub(crate) fn from_gpu_id(_id: u64) -> Result<Self> {
-        let duplicated = unsafe { libc::dup(1) };
-        if duplicated < 0 {
-            return Err(LavaFlowError::SharedMemoryOperation {
-                operation: "dup_gpu_handle",
-                source: std::io::Error::last_os_error(),
-            });
-        }
-        let owned = unsafe { OwnedFd::from_raw_fd(duplicated) };
-        Ok(Self::GpuOpaqueFd(owned))
+    pub(crate) fn from_gpu_external_fd(fd: OwnedFd) -> Self {
+        Self::GpuOpaqueFd(fd)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn from_cpu_shared_handle(fd: OwnedFd) -> Self {
+    pub(crate) fn from_cpu_shared_fd(fd: OwnedFd) -> Self {
         Self::CpuSharedFd(fd)
     }
 
@@ -33,39 +24,28 @@ impl InterprocessMemoryHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::FromRawFd;
 
     #[test]
-    fn from_gpu_id_reports_dup_failure_when_stdout_fd_invalid() {
-        let backup_stdout = unsafe { libc::dup(1) };
-        assert!(backup_stdout >= 0, "dup stdout for backup");
-
-        let close_rc = unsafe { libc::close(1) };
-        assert_eq!(close_rc, 0, "close stdout to force dup failure");
-
-        let err = InterprocessMemoryHandle::from_gpu_id(1).expect_err("dup should fail");
-        assert!(matches!(
-            err,
-            LavaFlowError::SharedMemoryOperation {
-                operation: "dup_gpu_handle",
-                ..
-            }
-        ));
-
-        let restore_rc = unsafe { libc::dup2(backup_stdout, 1) };
-        assert!(restore_rc >= 0, "restore stdout");
-        let _ = unsafe { libc::close(backup_stdout) };
-
-        let handle = InterprocessMemoryHandle::from_gpu_id(2).expect("dup succeeds after restore");
+    fn from_gpu_external_fd_reports_valid_fd() {
+        let mut fds = [0; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "create pipe for gpu handle");
+        let _read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let owned = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let handle = InterprocessMemoryHandle::from_gpu_external_fd(owned);
         assert!(handle.is_valid());
         assert!(matches!(handle, InterprocessMemoryHandle::GpuOpaqueFd(_)));
     }
 
     #[test]
-    fn from_cpu_shared_handle_reports_valid_fd() {
-        let duplicated = unsafe { libc::dup(1) };
-        assert!(duplicated >= 0, "dup stdout for cpu handle");
-        let owned = unsafe { OwnedFd::from_raw_fd(duplicated) };
-        let handle = InterprocessMemoryHandle::from_cpu_shared_handle(owned);
+    fn from_cpu_shared_fd_reports_valid_fd() {
+        let mut fds = [0; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "create pipe for cpu handle");
+        let _read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let owned = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let handle = InterprocessMemoryHandle::from_cpu_shared_fd(owned);
         assert!(handle.is_valid());
         assert!(matches!(handle, InterprocessMemoryHandle::CpuSharedFd(_)));
     }
