@@ -43,6 +43,12 @@ jobs:
           install_lavapipe: ${{ matrix.install_lavapipe }}
           install_swiftshader: ${{ matrix.install_swiftshader }}
 
+      - name: Install Mesa Vulkan drivers (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+
       - name: Vulkan diagnostics (Linux)
         if: runner.os == 'Linux'
         run: |
