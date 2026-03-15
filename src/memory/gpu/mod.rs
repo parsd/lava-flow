@@ -792,6 +792,17 @@ mod tests {
         }
     }
 
+    fn assert_error_matches(
+        err: &LavaFlowError,
+        expected: &str,
+        predicate: impl FnOnce(&LavaFlowError) -> bool,
+    ) {
+        assert!(
+            predicate(err),
+            "expected error matching {expected}, got {err:?}"
+        );
+    }
+
     fn allocator_instance_handle(allocator: &Allocator) -> u64 {
         allocator.context._runtime.instance.handle().as_raw()
     }
@@ -887,7 +898,9 @@ mod tests {
     fn new_reports_backend_unavailable_when_disabled() {
         let _guard = EnvGuard::set(ENV_DISABLE_VULKAN, "1");
         let err = Allocator::new().expect_err("constructor should fail without backend");
-        assert!(matches!(err, LavaFlowError::GpuBackendUnavailable));
+        assert_error_matches(&err, "LavaFlowError::GpuBackendUnavailable", |err| {
+            matches!(err, LavaFlowError::GpuBackendUnavailable)
+        });
     }
 
     #[test]
@@ -945,12 +958,18 @@ mod tests {
         with_allocator(|_| {
             let err =
                 Allocator::new_for_device(UNKNOWN_DEVICE_ID).expect_err("unknown device must fail");
-            assert!(matches!(
-                err,
-                LavaFlowError::GpuDeviceNotFound {
-                    device_id: UNKNOWN_DEVICE_ID,
-                }
-            ));
+            assert_error_matches(
+                &err,
+                "LavaFlowError::GpuDeviceNotFound { device_id: UNKNOWN_DEVICE_ID }",
+                |err| {
+                    matches!(
+                        err,
+                        LavaFlowError::GpuDeviceNotFound {
+                            device_id: UNKNOWN_DEVICE_ID,
+                        }
+                    )
+                },
+            );
         });
     }
 
@@ -1102,13 +1121,19 @@ mod tests {
     fn ensure_min_vulkan_version_rejects_older_versions() {
         let err = VulkanRuntime::ensure_min_vulkan_version(vk::API_VERSION_1_1)
             .expect_err("vulkan 1.1 should be rejected");
-        assert!(matches!(
-            err,
-            LavaFlowError::VulkanOperation {
-                operation: "check_instance_version",
-                ..
-            }
-        ));
+        assert_error_matches(
+            &err,
+            "LavaFlowError::VulkanOperation { operation: \"check_instance_version\", .. }",
+            |err| {
+                matches!(
+                    err,
+                    LavaFlowError::VulkanOperation {
+                        operation: "check_instance_version",
+                        ..
+                    }
+                )
+            },
+        );
     }
 
     #[test]
@@ -1129,12 +1154,18 @@ mod tests {
     #[test]
     fn select_physical_device_rejects_unknown_requested_index() {
         let err = Allocator::new_for_device(UNKNOWN_DEVICE_ID).expect_err("unknown index");
-        assert!(matches!(
-            err,
-            LavaFlowError::GpuDeviceNotFound {
-                device_id: UNKNOWN_DEVICE_ID
-            }
-        ));
+        assert_error_matches(
+            &err,
+            "LavaFlowError::GpuDeviceNotFound { device_id: UNKNOWN_DEVICE_ID }",
+            |err| {
+                matches!(
+                    err,
+                    LavaFlowError::GpuDeviceNotFound {
+                        device_id: UNKNOWN_DEVICE_ID
+                    }
+                )
+            },
+        );
     }
 
     #[test]
@@ -1144,13 +1175,19 @@ mod tests {
             let err = allocator
                 .allocate(BUFFER_SIZE)
                 .expect_err("forced memory type failure");
-            assert!(matches!(
-                err,
-                LavaFlowError::VulkanOperation {
-                    operation: "find_memory_type_index",
-                    ..
-                }
-            ));
+            assert_error_matches(
+                &err,
+                "LavaFlowError::VulkanOperation { operation: \"find_memory_type_index\", .. }",
+                |err| {
+                    matches!(
+                        err,
+                        LavaFlowError::VulkanOperation {
+                            operation: "find_memory_type_index",
+                            ..
+                        }
+                    )
+                },
+            );
         });
     }
 
@@ -1161,13 +1198,19 @@ mod tests {
             let err = allocator
                 .allocate(BUFFER_SIZE)
                 .expect_err("forced allocate memory failure");
-            assert!(matches!(
-                err,
-                LavaFlowError::VulkanOperation {
-                    operation: "allocate_memory",
-                    ..
-                }
-            ));
+            assert_error_matches(
+                &err,
+                "LavaFlowError::VulkanOperation { operation: \"allocate_memory\", .. }",
+                |err| {
+                    matches!(
+                        err,
+                        LavaFlowError::VulkanOperation {
+                            operation: "allocate_memory",
+                            ..
+                        }
+                    )
+                },
+            );
         });
     }
 
@@ -1178,13 +1221,19 @@ mod tests {
             let err = allocator
                 .allocate(BUFFER_SIZE)
                 .expect_err("forced small requirements failure");
-            assert!(matches!(
-                err,
-                LavaFlowError::VulkanOperation {
-                    operation: "get_buffer_memory_requirements",
-                    ..
-                }
-            ));
+            assert_error_matches(
+                &err,
+                "LavaFlowError::VulkanOperation { operation: \"get_buffer_memory_requirements\", .. }",
+                |err| {
+                    matches!(
+                        err,
+                        LavaFlowError::VulkanOperation {
+                            operation: "get_buffer_memory_requirements",
+                            ..
+                        }
+                    )
+                },
+            );
         });
     }
 
@@ -1195,13 +1244,19 @@ mod tests {
             let err = allocator
                 .allocate(BUFFER_SIZE)
                 .expect_err("forced bind memory failure");
-            assert!(matches!(
-                err,
-                LavaFlowError::VulkanOperation {
-                    operation: "bind_buffer_memory",
-                    ..
-                }
-            ));
+            assert_error_matches(
+                &err,
+                "LavaFlowError::VulkanOperation { operation: \"bind_buffer_memory\", .. }",
+                |err| {
+                    matches!(
+                        err,
+                        LavaFlowError::VulkanOperation {
+                            operation: "bind_buffer_memory",
+                            ..
+                        }
+                    )
+                },
+            );
         });
     }
 
@@ -1212,13 +1267,19 @@ mod tests {
             let err = allocator
                 .allocate(BUFFER_SIZE)
                 .expect_err("forced export failure");
-            assert!(matches!(
-                err,
-                LavaFlowError::VulkanOperation {
-                    operation: "export_memory_handle",
-                    ..
-                }
-            ));
+            assert_error_matches(
+                &err,
+                "LavaFlowError::VulkanOperation { operation: \"export_memory_handle\", .. }",
+                |err| {
+                    matches!(
+                        err,
+                        LavaFlowError::VulkanOperation {
+                            operation: "export_memory_handle",
+                            ..
+                        }
+                    )
+                },
+            );
         });
     }
 
@@ -1230,21 +1291,33 @@ mod tests {
                 .allocate(BUFFER_SIZE)
                 .expect_err("forced export syscall failure");
             #[cfg(windows)]
-            assert!(matches!(
-                err,
-                LavaFlowError::VulkanOperation {
-                    operation: "get_memory_win32_handle",
-                    ..
-                }
-            ));
+            assert_error_matches(
+                &err,
+                "LavaFlowError::VulkanOperation { operation: \"get_memory_win32_handle\", .. }",
+                |err| {
+                    matches!(
+                        err,
+                        LavaFlowError::VulkanOperation {
+                            operation: "get_memory_win32_handle",
+                            ..
+                        }
+                    )
+                },
+            );
             #[cfg(unix)]
-            assert!(matches!(
-                err,
-                LavaFlowError::VulkanOperation {
-                    operation: "get_memory_fd",
-                    ..
-                }
-            ));
+            assert_error_matches(
+                &err,
+                "LavaFlowError::VulkanOperation { operation: \"get_memory_fd\", .. }",
+                |err| {
+                    matches!(
+                        err,
+                        LavaFlowError::VulkanOperation {
+                            operation: "get_memory_fd",
+                            ..
+                        }
+                    )
+                },
+            );
         });
     }
 
@@ -1281,13 +1354,19 @@ mod tests {
         let result = DeviceContext::new(DEFAULT_DEVICE_ID);
         assert!(result.is_err(), "forced create device failure");
         let err = result.expect_err("error is present");
-        assert!(matches!(
-            err,
-            LavaFlowError::VulkanOperation {
-                operation: "create_device",
-                ..
-            }
-        ));
+        assert_error_matches(
+            &err,
+            "LavaFlowError::VulkanOperation { operation: \"create_device\", .. }",
+            |err| {
+                matches!(
+                    err,
+                    LavaFlowError::VulkanOperation {
+                        operation: "create_device",
+                        ..
+                    }
+                )
+            },
+        );
     }
 
     #[test]
@@ -1314,7 +1393,9 @@ mod tests {
         let result = DeviceContext::new(DEFAULT_DEVICE_ID);
         assert!(result.is_err(), "forced no physical device failure");
         let err = result.expect_err("error is present");
-        assert!(matches!(err, LavaFlowError::GpuBackendUnavailable));
+        assert_error_matches(&err, "LavaFlowError::GpuBackendUnavailable", |err| {
+            matches!(err, LavaFlowError::GpuBackendUnavailable)
+        });
     }
 
     #[test]
@@ -1323,12 +1404,18 @@ mod tests {
         let result = DeviceContext::new(DEFAULT_DEVICE_ID);
         assert!(result.is_err(), "forced no queue family failure");
         let err = result.expect_err("error is present");
-        assert!(matches!(
-            err,
-            LavaFlowError::VulkanOperation {
-                operation: "pick_queue_family",
-                ..
-            }
-        ));
+        assert_error_matches(
+            &err,
+            "LavaFlowError::VulkanOperation { operation: \"pick_queue_family\", .. }",
+            |err| {
+                matches!(
+                    err,
+                    LavaFlowError::VulkanOperation {
+                        operation: "pick_queue_family",
+                        ..
+                    }
+                )
+            },
+        );
     }
 }
