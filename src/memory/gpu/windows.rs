@@ -74,7 +74,7 @@ mod tests {
 
     #[test]
     fn export_memory_handle_and_duplicate_for_ipc_directly() {
-        if let Ok(mut allocator) = super::super::Allocator::new() {
+        if let Ok(allocator) = super::super::Allocator::new() {
             let buffer = allocator
                 .allocate(BUFFER_SIZE)
                 .expect("allocate gpu buffer");

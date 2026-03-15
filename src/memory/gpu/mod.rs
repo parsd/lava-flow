@@ -98,7 +98,7 @@ impl Allocator {
     }
 
     /// Allocates a GPU buffer and tags it with an exportable external handle.
-    pub fn allocate(&mut self, size: usize) -> Result<MemoryBuffer> {
+    pub fn allocate(&self, size: usize) -> Result<MemoryBuffer> {
         let requested_size = size;
         if requested_size == 0 {
             return Err(LavaFlowError::InvalidAllocationRequest {
@@ -902,7 +902,7 @@ mod tests {
     fn creates_allocator_per_discovered_device_and_allocates() {
         with_allocator(|_| {
             for device_id in available_device_ids() {
-                let mut per_device =
+                let per_device =
                     Allocator::new_for_device(device_id).expect("create per-device allocator");
                 assert_eq!(per_device.device_id(), device_id);
                 let buffer = per_device
