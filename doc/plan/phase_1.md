@@ -1,5 +1,7 @@
 # Phase 1: Foundation
 
+**Status:** Completed
+
 ## TL;DR
 
 Define the core types, errors, and scope detection logic. No GPU APIs or transports yet.

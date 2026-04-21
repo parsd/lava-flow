@@ -157,7 +157,7 @@ fn test_mpi_message_ordering() {
 
     if rank == 0 {
         for i in 0..1000 {
-            channel.send(Frame::new(i))?;
+            channel.send(Frame::Cpu(buffer_for_bench(i)))?;
         }
     } else {
         for i in 0..1000 {

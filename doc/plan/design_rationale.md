@@ -368,11 +368,17 @@ cargo bench --bench gpu_latency > current.txt
 
 ### Phase 3: Vulkan IPC (2-3 person weeks)
 
-**Goal:** Local zero-copy GPU communication
+**Goal:** Local channel runtime with point-to-point CPU shared-memory transport first and GPU IPC immediately after
 
-**Design decision:** External memory handles (not shared filesystem)
+**Design decision:** Start with synchronous local endpoints, implement point-to-point CPU local
+transport first behind internal transport server/client bootstrap, then add GPU IPC on top of
+device-local importable allocations
 
-**Why:** < 100 ns vs ~10 us for filesystem
+**Why:** CPU local transport carries less platform risk and validates the Layer-2 API quickly, while GPU IPC still needs
+the harder device-local import/export path and import-side runtime work. Keeping bootstrap inside
+the library avoids pushing pipe/socket orchestration into user code while still leaving room for
+future local fan-out as a separate semantic mode. Phase 3 defaults to sender-as-transport-server so
+that later 1 -> many local broadcast can reuse the same rendezvous structure.
 
 ---
 

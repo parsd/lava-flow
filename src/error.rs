@@ -121,6 +121,44 @@ pub enum LavaFlowError {
         #[source]
         source: std::io::Error,
     },
+
+    /// Channel metadata serialization or deserialization failed.
+    #[error("channel metadata codec failed during {operation}")]
+    ChannelMetadataCodec {
+        /// Metadata codec operation name.
+        operation: &'static str,
+        /// Source serialization error.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// Requested channel metadata encoding is not implemented.
+    #[error("unsupported metadata encoding: {encoding}")]
+    UnsupportedMetadataEncoding {
+        /// Human-readable encoding name.
+        encoding: &'static str,
+    },
+
+    /// Channel transport I/O failed during a platform operation.
+    #[error("channel transport operation failed during {operation}")]
+    ChannelTransportOperation {
+        /// Transport operation name.
+        operation: &'static str,
+        /// Source I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Channel transport was disconnected before the operation completed.
+    #[error("channel transport disconnected")]
+    ChannelDisconnected,
+
+    /// Channel buffer kind is not supported by the selected transport.
+    #[error("unsupported channel buffer kind: {kind}")]
+    UnsupportedChannelBufferKind {
+        /// Buffer kind string for diagnostics.
+        kind: &'static str,
+    },
 }
 
 /// Standard result type for lava-flow APIs.

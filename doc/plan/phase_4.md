@@ -11,7 +11,7 @@ Remote receive materialization uses receiver-channel allocator strategy.
 - MPI init/finalize wrapper
 - Rank resolution from process locations
 - `MpiTransport` send/recv (blocking and optional non-blocking)
-- Receiver representation mapping to `DirectTransfer` / `Materialized` for remote channels
+- Receiver representation mapping to `ExternalShare` / `Materialized` for remote channels
 - CI-safe tests gated behind `mpirun`
 
 ## Deliverables

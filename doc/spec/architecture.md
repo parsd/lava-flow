@@ -46,17 +46,15 @@ let tx = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone())
 
 let rx = ChannelBuilder::receiver(my_loc, peer_loc)
     .with_allocator(cpu_allocator)
-    .with_metadata_encoding(MetadataEncoding::Cbor)
     .build()?;
 
-let frame = Frame::Owned(payload_buffer);
 let meta = ImageMeta {
     used_size: payload_bytes,
     width: 1920,
     height: 1080,
 };
 
-tx.send(frame, &meta)?;
+tx.send(payload_buffer, &meta)?;
 let (frame, meta) = rx.recv::<ImageMeta>()?;
 let used = meta.used_size();
 ```
@@ -64,9 +62,10 @@ let used = meta.used_size();
 Key points:
 
 - Sender side does not require an allocator.
+- Sender side owns metadata encoding selection; local transports propagate it during connect.
 - Receiver side owns materialization policy via its configured allocator.
-- Endpoint introspection is lightweight: `scope()`, `receive_representation()`, and `configured_buffer_kind()`.
-- `recv::<M>()` is the default typed path; `recv_map()` is the dynamic fallback.
+- Endpoint introspection is lightweight: `scope()` and `receive_representation()`.
+- `recv::<M>()` is the default typed path returning `Frame`; `recv_map()` is the dynamic fallback.
 - Metadata always carries `used_size` for payload validity.
 
 ## Transport Routing
@@ -85,10 +84,7 @@ fn select_transport(scope: CommunicationScope, frame: &Frame) -> TransportKind {
 
 ## Receive Behavior
 
-Receiver properties are fixed at construction and queried via:
-
-- `receive_representation()`
-- `configured_buffer_kind()`
+Receiver properties are fixed at construction and queried via `receive_representation()`.
 
 Receive variants:
 

@@ -58,17 +58,6 @@ impl Allocator {
         buffer.zero_fill();
         Ok(buffer)
     }
-
-    /// Imports a CPU shared-memory handle into this process.
-    #[cfg(test)]
-    pub(crate) fn import_shared(
-        &self,
-        size: usize,
-        handle: InterprocessMemoryHandle,
-    ) -> Result<MemoryBuffer> {
-        let region = SharedMemoryRegion::from_handle(size, self.max_allocation_size, handle)?;
-        Ok(MemoryBuffer { region })
-    }
 }
 
 impl Default for Allocator {
@@ -93,6 +82,16 @@ pub struct MemoryBuffer {
 }
 
 impl MemoryBuffer {
+    /// Imports a CPU shared-memory handle into a buffer with platform hard-limit validation.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_shared_handle(
+        size: usize,
+        handle: InterprocessMemoryHandle,
+    ) -> Result<Self> {
+        let region = SharedMemoryRegion::from_handle(size, hard_max_cpu_allocation_size(), handle)?;
+        Ok(Self { region })
+    }
+
     fn zero_fill(&mut self) {
         unsafe { std::ptr::write_bytes(self.as_mut_ptr(), 0, self.size()) };
     }
@@ -128,7 +127,7 @@ impl MemoryBuffer {
     }
 
     /// Returns the interprocess shared-memory handle for this CPU buffer.
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn shared_handle(&self) -> Result<InterprocessMemoryHandle> {
         self.region.export_handle()
     }
@@ -230,9 +229,8 @@ mod tests {
         original.as_mut_slice()[TEST_BYTE_OFFSET] = TEST_BYTE_VALUE;
 
         let handle = original.shared_handle().expect("export handle");
-        let imported = allocator
-            .import_shared(BUFFER_SIZE, handle)
-            .expect("import shared handle");
+        let imported =
+            MemoryBuffer::from_shared_handle(BUFFER_SIZE, handle).expect("import shared handle");
         assert_eq!(imported.as_slice()[TEST_BYTE_OFFSET], TEST_BYTE_VALUE);
     }
 

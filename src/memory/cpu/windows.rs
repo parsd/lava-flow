@@ -46,7 +46,7 @@ impl SharedMemoryRegion {
         })
     }
 
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn from_handle(
         size: usize,
         max_allocation_size: usize,

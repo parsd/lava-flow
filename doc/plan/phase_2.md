@@ -1,5 +1,7 @@
 # Phase 2: Memory & Allocator
 
+**Status:** Completed
+
 ## TL;DR
 
 Implement Layer 1: backend-specific allocators for Vulkan GPU memory and CPU strategies.

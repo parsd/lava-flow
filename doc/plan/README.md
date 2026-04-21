@@ -6,14 +6,14 @@ Six-phase roadmap over 15-18 person weeks. Each phase is independently testable 
 
 ## Overview
 
-| Phase | Duration | Focus | Deliverable | Dependencies |
-| ----- | -------- | ----- | ----------- | ------------ |
-| **1** | 1-2 weeks | Core types, scope detection | Working scope detector | None |
-| **2** | 2-3 weeks | Memory allocators (GPU + CPU) | Unified memory API | Vulkan SDK 1.2+ |
-| **3** | 2-3 weeks | Vulkan IPC channels | Local channels | Phase 1, 2 |
-| **4** | 2-3 weeks | MPI transport | Remote channels | Phase 1, 2, OpenMPI 4.0+ |
-| **5** | 1-2 weeks | Cross-API sync, semaphores | CUDA/OpenCL import | Phase 3, 4 |
-| **6+** | 3+ weeks | Multi-language bindings | C++/Python APIs | Phase 1-5 stable |
+| Phase | Status | Duration | Focus | Deliverable | Dependencies |
+| ----- | ------ | -------- | ----- | ----------- | ------------ |
+| **1** | Completed | 1-2 weeks | Core types, scope detection | Working scope detector | None |
+| **2** | Completed | 2-3 weeks | Memory allocators (GPU + CPU) | Unified memory API | Vulkan SDK 1.2+ |
+| **3** | In Progress | 2-3 weeks | Vulkan IPC channels | Local channels | Phase 1, 2 |
+| **4** | Planned | 2-3 weeks | MPI transport | Remote channels | Phase 1, 2, OpenMPI 4.0+ |
+| **5** | Planned | 1-2 weeks | Cross-API sync, semaphores | CUDA/OpenCL import | Phase 3, 4 |
+| **6+** | Planned | 3+ weeks | Multi-language bindings | C++/Python APIs | Phase 1-5 stable |
 
 **Total estimated time:** 15-18 weeks (MVP = Phases 1-4, 10-12 weeks)
 
@@ -91,7 +91,6 @@ Phase-level success criteria are defined in the detailed phase specs.
 
 ## Next Steps
 
-1. **Review Phase 1 spec** [Phase 1](phase_1.md)
-2. **Set up development environment** (Rust 1.70+, Vulkan SDK 1.2+)
-3. **Start Phase 1 implementation** (core types)
-4. **Weekly progress reviews** (adjust timeline as needed)
+1. **Finish Phase 3 local channel runtime** [Phase 3](phase_3.md)
+2. **Start Phase 4 transport planning/implementation** [Phase 4](phase_4.md)
+3. **Keep weekly progress reviews** (adjust timeline as needed)

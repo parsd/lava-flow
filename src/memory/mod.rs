@@ -2,6 +2,6 @@
 //!
 //! This module provides CPU and GPU allocators and shared handle types.
 
-mod allocator;
+pub(crate) mod allocator;
 pub mod cpu;
 pub mod gpu;
