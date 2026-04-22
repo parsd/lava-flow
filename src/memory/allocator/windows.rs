@@ -1,4 +1,5 @@
 use super::InterprocessMemoryHandle;
+use crate::error::LavaFlowError;
 use std::os::windows::io::OwnedHandle;
 
 impl InterprocessMemoryHandle {
@@ -9,6 +10,28 @@ impl InterprocessMemoryHandle {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_cpu_shared_handle(handle: OwnedHandle) -> Self {
         Self::CpuSharedWin32Handle(handle)
+    }
+
+    pub(crate) fn try_clone(&self) -> crate::error::Result<Self> {
+        use std::os::windows::io::{AsHandle, BorrowedHandle};
+
+        fn clone_handle(handle: BorrowedHandle<'_>) -> crate::error::Result<OwnedHandle> {
+            handle
+                .try_clone_to_owned()
+                .map_err(|source| LavaFlowError::SharedMemoryOperation {
+                    operation: "duplicate_shared_handle",
+                    source,
+                })
+        }
+
+        match self {
+            Self::GpuOpaqueWin32Handle(handle) => Ok(Self::GpuOpaqueWin32Handle(clone_handle(
+                handle.as_handle(),
+            )?)),
+            Self::CpuSharedWin32Handle(handle) => Ok(Self::CpuSharedWin32Handle(clone_handle(
+                handle.as_handle(),
+            )?)),
+        }
     }
 
     /// Returns whether the wrapped handle value is non-null/usable.

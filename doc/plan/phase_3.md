@@ -63,6 +63,7 @@ Rationale:
 - `VulkanIpcTransport`
 - Local shared-memory transport integration
 - Internal local rendezvous model (`listen` / `accept` / `connect`) hidden behind builders
+- Versioned tagged local control protocol with explicit receiver import ACK/NACK
 - Integration tests for local IPC paths
 - Platform control-plane plan for real inter-process tests:
   - Unix: Unix-domain sockets with `SCM_RIGHTS` for fd transfer
@@ -77,6 +78,7 @@ Windows:
 - one side acts as transport server and performs `listen` / `accept`
 - the other side acts as transport client and performs `connect`
 - after connect, the sender performs per-message handle transfer as needed
+- local control messages are versioned so incompatible protocol revisions fail fast
 
 Users should not manage socket paths, pipe names, or connection ordering directly.
 
@@ -107,6 +109,20 @@ use a distinct `ChannelId`.
 Windows shared-memory handle duplication only needs the receiver process once the local connection is
 open. That is acceptable because the actual duplication happens at message-send time, not at
 builder-construction time.
+
+### Current Security Baseline
+
+The current local runtime now applies platform-local access control before challenge/response is
+introduced:
+
+- Windows:
+  - duplex named pipe is created with an explicit DACL
+  - default policy is current logon session only
+  - the same pipe carries bootstrap, envelopes, and import ACK/NACK traffic
+- Unix:
+  - local sockets are created under a private per-user runtime directory
+  - `XDG_RUNTIME_DIR/lava-flow/` is preferred when available
+  - fallback directories are created with `0700` permissions
 
 ### Current Phase 3 Default
 

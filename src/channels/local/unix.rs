@@ -1,10 +1,12 @@
-use super::{channel_invalid_input, channel_transport_error};
+use super::{FrameKind, channel_protocol_error, channel_transport_error};
 use crate::error::Result;
 use crate::memory::allocator::InterprocessMemoryHandle;
 use crate::types::ChannelId;
+use std::env;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
@@ -14,11 +16,21 @@ pub(crate) struct EndpointAddress(String);
 impl EndpointAddress {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_channel(channel_id: &ChannelId) -> Self {
-        Self(format!("/tmp/lava-flow-{}.sock", channel_id.as_str()))
+        let path = runtime_dir_path().join(format!("{}.sock", channel_id.as_str()));
+        Self(path.to_string_lossy().into_owned())
     }
 
     pub(super) fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl FrameKind {
+    pub(super) fn from_handle(handle: &InterprocessMemoryHandle) -> Self {
+        match handle {
+            InterprocessMemoryHandle::GpuOpaqueFd(_) => Self::Gpu,
+            InterprocessMemoryHandle::CpuSharedFd(_) => Self::Cpu,
+        }
     }
 }
 
@@ -28,6 +40,12 @@ pub(super) struct TransportSender {
 }
 
 impl TransportSender {
+    pub(super) fn read_exact(&mut self, bytes: &mut [u8]) -> Result<()> {
+        self.stream
+            .read_exact(bytes)
+            .map_err(|source| channel_transport_error("read_exact", source))
+    }
+
     pub(super) fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
         self.stream
             .write_all(bytes)
@@ -42,15 +60,60 @@ impl TransportSender {
 
     pub(super) fn send_cpu_handle(&mut self, handle: InterprocessMemoryHandle) -> Result<()> {
         let fd = match handle {
-            InterprocessMemoryHandle::CpuSharedFd(fd) => fd.into_raw_fd(),
+            InterprocessMemoryHandle::CpuSharedFd(fd) => fd,
             InterprocessMemoryHandle::GpuOpaqueFd(_) => {
-                return Err(channel_invalid_input("unexpected gpu handle for cpu ipc"));
+                return Err(channel_protocol_error(
+                    "send_cpu_handle",
+                    "unexpected gpu handle for cpu ipc",
+                ));
             }
         };
 
-        let send_result = send_fd(self.stream.as_raw_fd(), fd);
-        let _ = unsafe { libc::close(fd) };
-        send_result
+        self.send_fd(&fd)
+    }
+
+    pub(super) fn complete_transfer(&mut self) {}
+
+    pub(super) fn abort_transfer(&mut self) {}
+
+    fn send_fd(&self, fd: &OwnedFd) -> Result<()> {
+        let mut marker = [0_u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: marker.as_mut_ptr().cast(),
+            iov_len: marker.len(),
+        };
+        let mut control = vec![
+            0_u8;
+            unsafe {
+                libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize
+            }
+        ];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        // msg_control points at the ancillary data buffer that carries the passed descriptor.
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = control.len();
+
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            if cmsg.is_null() {
+                return Err(channel_protocol_error("send_fd", "missing cmsg header"));
+            }
+            // SCM_RIGHTS tells the kernel to duplicate this descriptor for the receiving process.
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            // The cmsghdr length covers the header plus exactly one passed file descriptor.
+            (*cmsg).cmsg_len =
+                libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize;
+            // CMSG_DATA is the payload area where the descriptor number itself is written.
+            *(libc::CMSG_DATA(cmsg).cast::<libc::c_int>()) = fd.as_raw_fd();
+        }
+
+        SYSCALLS
+            .sendmsg(self.stream.as_raw_fd(), &msg, 0)
+            .map(|_| ())
+            .map_err(|source| channel_transport_error("sendmsg", source))
     }
 }
 
@@ -62,6 +125,7 @@ pub(super) struct TransportListener {
 
 impl TransportListener {
     pub(super) fn bind(address: &EndpointAddress) -> Result<Self> {
+        Self::ensure_runtime_dir_exists()?;
         let path = PathBuf::from(address.as_str());
         if let Err(source) = fs::remove_file(&path)
             && source.kind() != std::io::ErrorKind::NotFound
@@ -71,6 +135,14 @@ impl TransportListener {
         let listener =
             UnixListener::bind(&path).map_err(|source| channel_transport_error("bind", source))?;
         Ok(Self { listener, path })
+    }
+
+    fn ensure_runtime_dir_exists() -> Result<()> {
+        let path = runtime_dir_path();
+        fs::create_dir_all(&path)
+            .map_err(|source| channel_transport_error("create_dir_all", source))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .map_err(|source| channel_transport_error("set_permissions", source))
     }
 
     pub(super) fn accept(self) -> Result<TransportSender> {
@@ -106,86 +178,78 @@ impl TransportReceiver {
             .map_err(|source| channel_transport_error("read_exact", source))
     }
 
+    pub(super) fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        self.stream
+            .write_all(bytes)
+            .map_err(|source| channel_transport_error("write_all", source))
+    }
+
+    pub(super) fn flush(&mut self) -> Result<()> {
+        self.stream
+            .flush()
+            .map_err(|source| channel_transport_error("flush", source))
+    }
+
     pub(super) fn recv_cpu_handle(&mut self) -> Result<InterprocessMemoryHandle> {
-        recv_fd(self.stream.as_raw_fd()).map(InterprocessMemoryHandle::from_cpu_shared_fd)
+        self.recv_fd()
+            .map(InterprocessMemoryHandle::from_cpu_shared_fd)
+    }
+
+    fn recv_fd(&mut self) -> Result<OwnedFd> {
+        let mut marker = [0_u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: marker.as_mut_ptr().cast(),
+            iov_len: marker.len(),
+        };
+        let mut control = vec![
+            0_u8;
+            unsafe {
+                libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize
+            }
+        ];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = control.len();
+
+        SYSCALLS
+            .recvmsg(self.stream.as_raw_fd(), &mut msg, 0)
+            .map_err(|source| channel_transport_error("recvmsg", source))?;
+
+        let fd = unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            if cmsg.is_null() {
+                return Err(channel_protocol_error("recv_fd", "missing received handle"));
+            }
+            if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
+                return Err(channel_protocol_error(
+                    "recv_fd",
+                    "unexpected received cmsg type",
+                ));
+            }
+            *(libc::CMSG_DATA(cmsg).cast::<libc::c_int>())
+        };
+
+        SYSCALLS
+            .fcntl_setfd_cloexec(fd)
+            .map_err(|source| channel_transport_error("fcntl_cloexec", source))?;
+
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        Ok(owned)
     }
 }
 
-fn send_fd(socket: libc::c_int, fd: libc::c_int) -> Result<()> {
-    let mut marker = [0_u8; 1];
-    let mut iov = libc::iovec {
-        iov_base: marker.as_mut_ptr().cast(),
-        iov_len: marker.len(),
-    };
-    let mut control = vec![
-        0_u8;
-        unsafe {
-            libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize
-        }
-    ];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
-
-    unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        if cmsg.is_null() {
-            return Err(channel_invalid_input("missing cmsg header"));
-        }
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len =
-            libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize;
-        *(libc::CMSG_DATA(cmsg).cast::<libc::c_int>()) = fd;
-    }
-
-    SYSCALLS
-        .sendmsg(socket, &msg, 0)
-        .map(|_| ())
-        .map_err(|source| channel_transport_error("sendmsg", source))
-}
-
-fn recv_fd(socket: libc::c_int) -> Result<OwnedFd> {
-    let mut marker = [0_u8; 1];
-    let mut iov = libc::iovec {
-        iov_base: marker.as_mut_ptr().cast(),
-        iov_len: marker.len(),
-    };
-    let mut control = vec![
-        0_u8;
-        unsafe {
-            libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize
-        }
-    ];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
-
-    SYSCALLS
-        .recvmsg(socket, &mut msg, 0)
-        .map_err(|source| channel_transport_error("recvmsg", source))?;
-
-    let fd = unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        if cmsg.is_null() {
-            return Err(channel_invalid_input("missing received handle"));
-        }
-        if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
-            return Err(channel_invalid_input("unexpected received cmsg type"));
-        }
-        *(libc::CMSG_DATA(cmsg).cast::<libc::c_int>())
-    };
-
-    SYSCALLS
-        .fcntl_setfd_cloexec(fd)
-        .map_err(|source| channel_transport_error("fcntl_cloexec", source))?;
-
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    Ok(owned)
+fn runtime_dir_path() -> PathBuf {
+    // Prefer the standard per-user runtime directory for local IPC sockets. It is typically
+    // private to the current user and avoids exposing endpoints directly under /tmp.
+    let base = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let uid = unsafe { libc::geteuid() };
+            env::temp_dir().join(format!("lava-flow-uid-{uid}"))
+        });
+    base.join("lava-flow")
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -349,5 +413,22 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn endpoint_address_uses_private_runtime_directory() {
+        let channel_id = ChannelId::new("channel-0").expect("channel id");
+        let address = EndpointAddress::from_channel(&channel_id);
+
+        assert!(
+            address.as_str().contains("lava-flow"),
+            "expected unix endpoint under lava-flow runtime directory, got {}",
+            address.as_str()
+        );
+        assert!(
+            address.as_str().ends_with("channel-0.sock"),
+            "expected unix endpoint to end with socket filename, got {}",
+            address.as_str()
+        );
     }
 }

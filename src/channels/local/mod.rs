@@ -15,6 +15,8 @@ use unix as platform;
 #[cfg(windows)]
 use windows as platform;
 
+const LOCAL_PROTOCOL_VERSION: u8 = 1;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct ConnectionHeader {
     encoding: MetadataEncoding,
@@ -26,15 +28,104 @@ impl ConnectionHeader {
     }
 
     fn write_to(self, transport: &mut platform::TransportSender) -> Result<()> {
-        transport.write_all(&[self.encoding as u8])?;
+        transport.write_all(&[
+            ProtocolTag::ConnectionHeader as u8,
+            LOCAL_PROTOCOL_VERSION,
+            self.encoding as u8,
+        ])?;
         transport.flush()
     }
 
     fn read_from(transport: &mut platform::TransportReceiver) -> Result<Self> {
-        let mut encoding = [0_u8; 1];
-        transport.read_exact(&mut encoding)?;
-        let encoding = MetadataEncoding::try_from(encoding[0])?;
+        let tag = ProtocolTag::read_from_receiver(transport, "read_connection_header")?;
+        if tag != ProtocolTag::ConnectionHeader {
+            return Err(channel_protocol_error(
+                "read_connection_header",
+                "unexpected protocol tag",
+            ));
+        }
+
+        let mut header = [0_u8; 2];
+        transport.read_exact(&mut header)?;
+        if header[0] != LOCAL_PROTOCOL_VERSION {
+            return Err(channel_protocol_error(
+                "read_connection_header",
+                "unsupported local protocol version",
+            ));
+        }
+
+        let encoding = MetadataEncoding::try_from(header[1])?;
         Ok(Self { encoding })
+    }
+}
+
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ProtocolTag {
+    ConnectionHeader = 1,
+    MessageEnvelope = 2,
+    ImportOk = 3,
+    ImportFailed = 4,
+}
+
+impl TryFrom<u8> for ProtocolTag {
+    type Error = LavaFlowError;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(Self::ConnectionHeader),
+            2 => Ok(Self::MessageEnvelope),
+            3 => Ok(Self::ImportOk),
+            4 => Ok(Self::ImportFailed),
+            _ => Err(channel_protocol_error(
+                "decode_protocol_tag",
+                "unknown protocol tag",
+            )),
+        }
+    }
+}
+
+impl ProtocolTag {
+    fn read_from_sender(
+        transport: &mut platform::TransportSender,
+        operation: &'static str,
+    ) -> Result<Self> {
+        let mut tag = [0_u8; 1];
+        transport.read_exact(&mut tag)?;
+        Self::try_from(tag[0])
+            .map_err(|_| channel_protocol_error(operation, "unknown protocol tag"))
+    }
+
+    fn read_from_receiver(
+        transport: &mut platform::TransportReceiver,
+        operation: &'static str,
+    ) -> Result<Self> {
+        let mut tag = [0_u8; 1];
+        transport.read_exact(&mut tag)?;
+        Self::try_from(tag[0])
+            .map_err(|_| channel_protocol_error(operation, "unknown protocol tag"))
+    }
+}
+
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum FrameKind {
+    Cpu = 1,
+    Gpu = 2,
+}
+
+impl TryFrom<u8> for FrameKind {
+    type Error = LavaFlowError;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(Self::Cpu),
+            2 => Ok(Self::Gpu),
+            _ => Err(channel_protocol_error(
+                "decode_frame_kind",
+                "unknown frame kind",
+            )),
+        }
     }
 }
 
@@ -77,7 +168,19 @@ impl CpuSender {
     {
         let envelope =
             MessageEnvelope::from_frame_and_metadata(frame.into(), self.encoding, metadata)?;
-        envelope.write_to(&mut self.transport)
+        let result = envelope
+            .write_to(&mut self.transport)
+            .and_then(|()| self.recv_import_ack());
+        match result {
+            Ok(()) => {
+                self.transport.complete_transfer();
+                Ok(())
+            }
+            Err(error) => {
+                self.transport.abort_transfer();
+                Err(error)
+            }
+        }
     }
 
     /// Sends a payload frame with dynamic metadata through local CPU IPC.
@@ -88,7 +191,33 @@ impl CpuSender {
     {
         let envelope =
             MessageEnvelope::from_frame_and_metadata(frame.into(), self.encoding, &metadata)?;
-        envelope.write_to(&mut self.transport)
+        let result = envelope
+            .write_to(&mut self.transport)
+            .and_then(|()| self.recv_import_ack());
+        match result {
+            Ok(()) => {
+                self.transport.complete_transfer();
+                Ok(())
+            }
+            Err(error) => {
+                self.transport.abort_transfer();
+                Err(error)
+            }
+        }
+    }
+
+    fn recv_import_ack(&mut self) -> Result<()> {
+        match ProtocolTag::read_from_sender(&mut self.transport, "read_import_ack")? {
+            ProtocolTag::ImportOk => Ok(()),
+            ProtocolTag::ImportFailed => Err(channel_protocol_error(
+                "read_import_ack",
+                "receiver rejected imported handle",
+            )),
+            _ => Err(channel_protocol_error(
+                "read_import_ack",
+                "unexpected protocol tag",
+            )),
+        }
     }
 }
 
@@ -135,8 +264,17 @@ impl CpuReceiver {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn recv<M: ChannelMetadata>(&mut self) -> Result<(Frame, M)> {
         let message = MessageEnvelope::read_from(&mut self.transport)?;
+        let frame = match message.try_into_frame() {
+            Ok(frame) => {
+                self.send_import_ack(ProtocolTag::ImportOk)?;
+                frame
+            }
+            Err(error) => {
+                let _ = self.send_import_ack(ProtocolTag::ImportFailed);
+                return Err(error);
+            }
+        };
         let metadata = message.decode_metadata(self.encoding)?;
-        let frame = message.into_frame()?;
         Ok((frame, metadata))
     }
 
@@ -144,9 +282,23 @@ impl CpuReceiver {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn recv_map(&mut self) -> Result<(Frame, MessageMeta)> {
         let message = MessageEnvelope::read_from(&mut self.transport)?;
+        let frame = match message.try_into_frame() {
+            Ok(frame) => {
+                self.send_import_ack(ProtocolTag::ImportOk)?;
+                frame
+            }
+            Err(error) => {
+                let _ = self.send_import_ack(ProtocolTag::ImportFailed);
+                return Err(error);
+            }
+        };
         let metadata = message.decode_metadata(self.encoding)?;
-        let frame = message.into_frame()?;
         Ok((frame, metadata))
+    }
+
+    fn send_import_ack(&mut self, tag: ProtocolTag) -> Result<()> {
+        self.transport.write_all(&[tag as u8])?;
+        self.transport.flush()
     }
 }
 
@@ -178,30 +330,59 @@ impl MessageEnvelope {
             handle,
             metadata,
         } = self;
-        let payload_size =
-            u64::try_from(size).map_err(|_| channel_invalid_input("payload size overflow"))?;
-        let metadata_len = u32::try_from(metadata.len())
-            .map_err(|_| channel_invalid_input("metadata length overflow"))?;
+        let payload_size = size as u64;
+        let metadata_len = u32::try_from(metadata.len()).map_err(|_| {
+            channel_protocol_error("write_message_envelope", "metadata length overflow")
+        })?;
+        let kind = FrameKind::from_handle(&handle);
 
+        transport.write_all(&[ProtocolTag::MessageEnvelope as u8, kind as u8])?;
         transport.write_all(&payload_size.to_le_bytes())?;
         transport.send_cpu_handle(handle)?;
-        transport.write_all(&metadata_len.to_le_bytes())?;
-        transport.write_all(&metadata)?;
-        transport.flush()
+        let result = (|| {
+            transport.write_all(&metadata_len.to_le_bytes())?;
+            transport.write_all(&metadata)?;
+            transport.flush()
+        })();
+        if result.is_err() {
+            transport.abort_transfer();
+        }
+        result
     }
 
     fn read_from(transport: &mut platform::TransportReceiver) -> Result<Self> {
+        let tag = ProtocolTag::read_from_receiver(transport, "read_message_envelope")?;
+        if tag != ProtocolTag::MessageEnvelope {
+            return Err(channel_protocol_error(
+                "read_message_envelope",
+                "unexpected protocol tag",
+            ));
+        }
+
+        let mut kind = [0_u8; 1];
+        transport.read_exact(&mut kind)?;
+        let kind = FrameKind::try_from(kind[0])?;
+
         let mut payload_size_bytes = [0_u8; 8];
         transport.read_exact(&mut payload_size_bytes)?;
-        let size = usize::try_from(u64::from_le_bytes(payload_size_bytes))
-            .map_err(|_| channel_invalid_input("payload size overflow"))?;
+        let size = usize::try_from(u64::from_le_bytes(payload_size_bytes)).map_err(|_| {
+            channel_protocol_error("read_message_envelope", "payload size overflow")
+        })?;
 
         let handle = transport.recv_cpu_handle()?;
+        if FrameKind::from_handle(&handle) != kind {
+            return Err(channel_protocol_error(
+                "read_message_envelope",
+                "frame kind does not match transferred handle",
+            ));
+        }
 
         let mut metadata_len_bytes = [0_u8; 4];
         transport.read_exact(&mut metadata_len_bytes)?;
-        let metadata_len = usize::try_from(u32::from_le_bytes(metadata_len_bytes))
-            .map_err(|_| channel_invalid_input("metadata length overflow"))?;
+        let metadata_len =
+            usize::try_from(u32::from_le_bytes(metadata_len_bytes)).map_err(|_| {
+                channel_protocol_error("read_message_envelope", "metadata length overflow")
+            })?;
         let mut metadata = vec![0_u8; metadata_len];
         transport.read_exact(&mut metadata)?;
 
@@ -226,9 +407,15 @@ impl MessageEnvelope {
         }
     }
 
-    fn into_frame(self) -> Result<Frame> {
-        let buffer = cpu::MemoryBuffer::from_shared_handle(self.size, self.handle)?;
-        Ok(Frame::Cpu(buffer))
+    fn try_into_frame(&self) -> Result<Frame> {
+        match FrameKind::from_handle(&self.handle) {
+            FrameKind::Cpu => {
+                let buffer =
+                    cpu::MemoryBuffer::from_shared_handle(self.size, self.handle.try_clone()?)?;
+                Ok(Frame::Cpu(buffer))
+            }
+            FrameKind::Gpu => Err(LavaFlowError::UnsupportedChannelBufferKind { kind: "gpu" }),
+        }
     }
 
     fn encode_metadata<M: ChannelMetadata>(
@@ -267,9 +454,9 @@ fn channel_transport_error(operation: &'static str, source: std::io::Error) -> L
     }
 }
 
-fn channel_invalid_input(message: &'static str) -> LavaFlowError {
+fn channel_protocol_error(operation: &'static str, message: &'static str) -> LavaFlowError {
     LavaFlowError::ChannelTransportOperation {
-        operation: "decode_envelope",
+        operation,
         source: std::io::Error::new(std::io::ErrorKind::InvalidInput, message),
     }
 }
@@ -351,16 +538,26 @@ mod tests {
             width: 1920,
             height: 1080,
         };
+        // send() waits for the receiver-side import ACK, so recv() must run concurrently.
+        let recv_thread = thread::spawn(move || {
+            let (frame, received) = receiver.recv::<TestMeta>().expect("receive typed metadata");
+            let Frame::Cpu(imported) = frame else {
+                panic!("expected cpu frame");
+            };
+            (
+                received,
+                imported.size(),
+                imported.as_slice()[TEST_BYTE_OFFSET],
+            )
+        });
+
         sender.send(buffer, &metadata).expect("send typed metadata");
 
-        let (frame, received) = receiver.recv::<TestMeta>().expect("receive typed metadata");
+        let (received, imported_size, imported_value) =
+            recv_thread.join().expect("receiver thread must not panic");
         assert_eq!(received, metadata);
-
-        let Frame::Cpu(imported) = frame else {
-            panic!("expected cpu frame");
-        };
-        assert_eq!(imported.size(), BUFFER_SIZE);
-        assert_eq!(imported.as_slice()[TEST_BYTE_OFFSET], TEST_BYTE_VALUE);
+        assert_eq!(imported_size, BUFFER_SIZE);
+        assert_eq!(imported_value, TEST_BYTE_VALUE);
     }
 
     #[test]
@@ -378,13 +575,19 @@ mod tests {
             used_size: USED_SIZE,
             values,
         };
+        // send_map() also blocks on the receiver-side import ACK, so recv_map() must run concurrently.
+        let recv_thread = thread::spawn(move || {
+            let (frame, received) = receiver.recv_map().expect("receive dynamic metadata");
+            assert!(matches!(frame, Frame::Cpu(_)));
+            received
+        });
+
         sender
             .send_map(buffer, metadata.clone())
             .expect("send dynamic metadata");
 
-        let (frame, received) = receiver.recv_map().expect("receive dynamic metadata");
+        let received = recv_thread.join().expect("receiver thread must not panic");
         assert_eq!(received, metadata);
-        assert!(matches!(frame, Frame::Cpu(_)));
     }
 
     #[test]
@@ -396,6 +599,27 @@ mod tests {
         let err = receiver
             .recv_map()
             .expect_err("recv must fail after sender disconnect");
+        assert!(matches!(err, LavaFlowError::ChannelDisconnected));
+    }
+
+    #[test]
+    fn sender_reports_disconnect_when_receiver_is_dropped() {
+        let (mut sender, receiver) =
+            test_pair(MetadataEncoding::Json).expect("create cpu local ipc pair");
+        drop(receiver);
+
+        let buffer = test_allocator()
+            .allocate(BUFFER_SIZE)
+            .expect("allocate payload");
+        let metadata = TestMeta {
+            used_size: USED_SIZE,
+            width: 16,
+            height: 16,
+        };
+
+        let err = sender
+            .send(buffer, &metadata)
+            .expect_err("send must fail after receiver disconnect");
         assert!(matches!(err, LavaFlowError::ChannelDisconnected));
     }
 
@@ -454,5 +678,35 @@ mod tests {
         let reverse = EndpointAddress::from_channel(&second);
 
         assert_ne!(forward, reverse);
+    }
+
+    #[test]
+    fn receiver_rejects_unsupported_protocol_version() {
+        let address = support::test_address();
+        let listener = platform::TransportListener::bind(&address).expect("bind transport");
+        let receiver_address = address.clone();
+        let receiver_thread = thread::spawn(move || CpuReceiver::connect(&receiver_address));
+
+        let mut sender_transport = listener.accept().expect("accept transport");
+        sender_transport
+            .write_all(&[
+                ProtocolTag::ConnectionHeader as u8,
+                LOCAL_PROTOCOL_VERSION + 1,
+                MetadataEncoding::Json as u8,
+            ])
+            .expect("write invalid connection header");
+        sender_transport.flush().expect("flush invalid header");
+
+        let err = receiver_thread
+            .join()
+            .expect("receiver connect thread must not panic")
+            .expect_err("receiver must reject unsupported protocol version");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "read_connection_header",
+                ..
+            }
+        ));
     }
 }

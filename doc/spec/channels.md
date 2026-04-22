@@ -108,6 +108,7 @@ Public intent:
 - the other side acts as transport client and performs `connect`
 - sender-configured metadata encoding is communicated during connection bootstrap
 - after connection, message flow stays normal `send` / `recv`
+- local transports use a small versioned binary protocol rather than serializing Rust structs
 
 Users should not be required to implement their own pipe/socket bootstrap logic to use local
 channels.
@@ -139,6 +140,55 @@ The transport server does not need to always be the channel receiver in the abst
 current Phase 3 default is sender-listen, receiver-connect because that keeps the path open for
 future 1 -> many local broadcast without changing the rendezvous model, but that should remain an
 implementation choice rather than a public API rule.
+
+## Current Local Protocol
+
+Phase 3 local IPC currently uses a tagged binary control protocol.
+
+Connection bootstrap:
+
+- sender accepts the transport connection
+- sender writes a connection header:
+  - protocol tag
+  - protocol version
+  - metadata encoding
+- receiver validates the version before normal message I/O begins
+
+Per-message flow:
+
+- sender writes a message-envelope tag
+- sender writes the payload backend kind tag derived from the transferred handle
+- sender writes payload size
+- sender transfers the shared-memory handle
+- sender writes serialized metadata bytes
+- receiver imports the handle and then sends either:
+  - `ImportOk`
+  - `ImportFailed`
+
+This means `send()` is synchronous at the protocol level: it completes only after the receiver has
+either accepted the imported handle or rejected it.
+
+## Current Local Security
+
+Phase 3 local security is transport-specific and currently implemented as follows.
+
+Windows:
+
+- local CPU IPC uses one duplex named pipe for bootstrap, envelopes, and import ACK/NACK traffic
+- the named pipe is created with an explicit DACL rather than the Windows default
+- the current implementation grants access to the current logon session only
+- the granted access mask is aligned with the actual duplex client open mode used by the transport
+
+Unix:
+
+- local CPU IPC uses Unix-domain sockets with `SCM_RIGHTS` for fd transfer
+- the socket path is derived under a private per-user runtime directory
+- `XDG_RUNTIME_DIR/lava-flow/` is preferred when available
+- the fallback is a per-user directory under the system temp directory
+- the runtime directory is created with `0700` permissions before bind
+
+These measures reduce cross-user access to local IPC endpoints before the later shared-secret
+challenge/response hardening is added.
 
 ### Point-To-Point First
 

@@ -67,6 +67,8 @@ Key points:
 - Endpoint introspection is lightweight: `scope()` and `receive_representation()`.
 - `recv::<M>()` is the default typed path returning `Frame`; `recv_map()` is the dynamic fallback.
 - Metadata always carries `used_size` for payload validity.
+- Current local transports use a versioned tagged binary control protocol with receiver import
+  acknowledgment before `send()` completes.
 
 ## Transport Routing
 
@@ -114,6 +116,17 @@ implementation.
   2. API stability
   3. coverage completeness
 - Keep test-only fault injection out of production runtime branches.
+
+## Current Local Security
+
+Current local transport hardening is platform-specific:
+
+- Windows named pipes are created with an explicit current-logon-session DACL rather than the
+  default descriptor, and the current implementation uses one duplex pipe per local channel.
+- Unix-domain sockets live under a private per-user runtime directory, not directly under `/tmp`.
+
+This is the current baseline before later peer validation and shared-secret challenge/response are
+added on top.
 
 ## Related Docs
 

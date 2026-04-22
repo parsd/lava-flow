@@ -1,4 +1,5 @@
 use super::InterprocessMemoryHandle;
+use crate::error::LavaFlowError;
 use std::os::fd::OwnedFd;
 
 impl InterprocessMemoryHandle {
@@ -9,6 +10,23 @@ impl InterprocessMemoryHandle {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_cpu_shared_fd(fd: OwnedFd) -> Self {
         Self::CpuSharedFd(fd)
+    }
+
+    pub(crate) fn try_clone(&self) -> crate::error::Result<Self> {
+        use std::os::fd::{AsFd, BorrowedFd};
+
+        fn clone_fd(fd: BorrowedFd<'_>) -> crate::error::Result<OwnedFd> {
+            fd.try_clone_to_owned()
+                .map_err(|source| LavaFlowError::SharedMemoryOperation {
+                    operation: "dup_shared_handle",
+                    source,
+                })
+        }
+
+        match self {
+            Self::GpuOpaqueFd(fd) => Ok(Self::GpuOpaqueFd(clone_fd(fd.as_fd())?)),
+            Self::CpuSharedFd(fd) => Ok(Self::CpuSharedFd(clone_fd(fd.as_fd())?)),
+        }
     }
 
     /// Returns whether the wrapped handle value is non-null/usable.
