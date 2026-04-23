@@ -64,6 +64,8 @@ Rationale:
 - Local shared-memory transport integration
 - Internal local rendezvous model (`listen` / `accept` / `connect`) hidden behind builders
 - Versioned tagged local control protocol with explicit receiver import ACK/NACK
+- Configurable local envelope-size limits enforced before metadata allocation or shared-memory
+  import
 - Integration tests for local IPC paths
 - Platform control-plane plan for real inter-process tests:
   - Unix: Unix-domain sockets with `SCM_RIGHTS` for fd transfer
@@ -121,8 +123,17 @@ introduced:
   - the same pipe carries bootstrap, envelopes, and import ACK/NACK traffic
 - Unix:
   - local sockets are created under a private per-user runtime directory
-  - `XDG_RUNTIME_DIR/lava-flow/` is preferred when available
-  - fallback directories are created with `0700` permissions
+  - `LAVA_FLOW_RUNTIME_DIR` is the preferred explicit override for containers/orchestrators
+  - otherwise `XDG_RUNTIME_DIR/lava-flow/` is preferred when available
+  - if that is unavailable, `/run/user/<uid>/lava-flow/` is used when present
+  - final fallback is `$HOME/.local/run/lava-flow/`
+  - the selected runtime directory is required to be non-symlinked, owned by the effective user,
+    and forced to `0700`
+- Local protocol limits:
+  - default payload cap is `1 GiB`
+  - default metadata cap is `1 MiB`
+  - the local sender/listener and receiver are constructed with explicit limits
+  - later builder defaults should provide those values at the public API boundary
 
 ### Current Phase 3 Default
 

@@ -28,6 +28,21 @@ impl Guard {
             _lock: lock,
         }
     }
+
+    /// Removes `key` for the guard lifetime and restores the previous state on drop.
+    pub(crate) fn unset(key: &'static str) -> Self {
+        let lock = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(key);
+        // Serialized with a process-wide lock for test safety.
+        unsafe { std::env::remove_var(key) };
+        Self {
+            key,
+            previous,
+            _lock: lock,
+        }
+    }
 }
 
 impl Drop for Guard {
@@ -67,6 +82,17 @@ mod tests {
             assert_eq!(std::env::var(KEY_ABSENT).as_deref(), Ok(TEMP));
         }
         assert!(std::env::var(KEY_ABSENT).is_err());
+    }
+
+    #[test]
+    fn guard_unset_restores_previous_value() {
+        unsafe { std::env::set_var(KEY_RESTORE, ORIGINAL) };
+        {
+            let _guard = Guard::unset(KEY_RESTORE);
+            assert!(std::env::var(KEY_RESTORE).is_err());
+        }
+        assert_eq!(std::env::var(KEY_RESTORE).as_deref(), Ok(ORIGINAL));
+        unsafe { std::env::remove_var(KEY_RESTORE) };
     }
 
     #[test]

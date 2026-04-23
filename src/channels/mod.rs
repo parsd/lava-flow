@@ -143,3 +143,61 @@ impl From<gpu::MemoryBuffer> for Frame {
         Self::Gpu(buffer)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_encoding_rejects_unknown_wire_value() {
+        let err = MetadataEncoding::try_from(99).expect_err("unknown encoding must fail");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "decode_connection_header",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn message_meta_used_size_returns_stored_value() {
+        let meta = MessageMeta {
+            used_size: 17,
+            values: BTreeMap::new(),
+        };
+        assert_eq!(meta.used_size(), 17);
+    }
+
+    #[test]
+    fn frame_cpu_helpers_cover_size_and_variant_access() {
+        let buffer = cpu::Allocator::with_max_allocation_size(usize::MAX)
+            .allocate(64)
+            .expect("allocate cpu buffer");
+        let frame = Frame::from(buffer);
+        assert_eq!(frame.size(), 64);
+        assert!(frame.into_cpu().is_some());
+
+        let buffer = cpu::Allocator::with_max_allocation_size(usize::MAX)
+            .allocate(64)
+            .expect("allocate cpu buffer");
+        let frame = Frame::from(buffer);
+        assert!(frame.into_gpu().is_none());
+    }
+
+    #[test]
+    fn frame_gpu_helpers_cover_size_and_variant_access() {
+        let allocator = match gpu::Allocator::new() {
+            Ok(allocator) => allocator,
+            Err(_) => return,
+        };
+        let buffer = allocator.allocate(64).expect("allocate gpu buffer");
+        let frame = Frame::from(buffer);
+        assert_eq!(frame.size(), 64);
+        assert!(frame.into_gpu().is_some());
+
+        let buffer = allocator.allocate(64).expect("allocate gpu buffer");
+        let frame = Frame::from(buffer);
+        assert!(frame.into_cpu().is_none());
+    }
+}

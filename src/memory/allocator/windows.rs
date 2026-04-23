@@ -80,4 +80,18 @@ mod tests {
             InterprocessMemoryHandle::GpuOpaqueWin32Handle(_)
         ));
     }
+
+    #[test]
+    fn cpu_shared_handle_try_clone_preserves_cpu_variant() {
+        let allocator = crate::memory::cpu::Allocator::with_max_allocation_size(usize::MAX);
+        let buffer = allocator.allocate(64).expect("allocate cpu buffer");
+        let handle = buffer.shared_handle().expect("export cpu shared handle");
+
+        let cloned = handle.try_clone().expect("clone cpu shared handle");
+        assert!(matches!(
+            cloned,
+            InterprocessMemoryHandle::CpuSharedWin32Handle(_)
+        ));
+        assert!(cloned.is_valid());
+    }
 }

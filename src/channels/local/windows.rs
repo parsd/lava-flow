@@ -32,6 +32,11 @@ impl EndpointAddress {
         Self(format!(r"\\.\pipe\lava-flow-{}", channel_id.as_str()))
     }
 
+    #[cfg(test)]
+    pub(in crate::channels::local) fn from_test_channel(channel_id: &ChannelId) -> Self {
+        Self::from_channel(channel_id)
+    }
+
     pub(super) fn as_str(&self) -> &str {
         &self.0
     }
@@ -153,15 +158,40 @@ impl NamedPipeSecurityDescriptor {
         // A SID (security identifier) is Windows' variable-length binary identity for a user,
         // group, or logon session. The ACL stores SID bytes in each ACE to describe who is
         // allowed to access the named pipe.
-        let sid_size = SYSCALLS.sid_size(&sid_words);
-        let acl_size =
-            std::mem::size_of::<ACL>() + std::mem::size_of::<ACCESS_ALLOWED_ACE>() + sid_size
-                - std::mem::size_of::<u32>();
-        let mut acl_words = vec![0_u32; acl_size.div_ceil(std::mem::size_of::<u32>())];
-        let acl = acl_words.as_mut_ptr().cast::<ACL>();
-        SYSCALLS.initialize_acl(acl, acl_size as u32)?;
-        SYSCALLS.add_access_allowed_ace(acl, access_mask.bits(), &sid_words)?;
+        let mut acl_words = Self::build_acl_words(access_mask, &sid_words)?;
+        let security_descriptor = Self::build_security_descriptor(&mut acl_words)?;
+        Ok(Self::pin_descriptor(security_descriptor, acl_words))
+    }
 
+    fn as_mut_ptr(self: Pin<&mut Self>) -> *mut SECURITY_ATTRIBUTES {
+        let this = unsafe { self.get_unchecked_mut() };
+        &mut this.security_attributes
+    }
+
+    fn build_acl_words(
+        access_mask: PipeAccessMask,
+        sid_words: &[u32],
+    ) -> std::io::Result<Vec<u32>> {
+        let acl_size = Self::acl_size_bytes(sid_words);
+        let mut acl_words = vec![0_u32; acl_size.div_ceil(std::mem::size_of::<u32>())];
+        let acl = Self::acl_ptr(&mut acl_words);
+        SYSCALLS.initialize_acl(acl, acl_size as u32)?;
+        SYSCALLS.add_access_allowed_ace(acl, access_mask.bits(), sid_words)?;
+        Ok(acl_words)
+    }
+
+    fn acl_size_bytes(sid_words: &[u32]) -> usize {
+        let sid_size = SYSCALLS.sid_size(sid_words);
+        std::mem::size_of::<ACL>() + std::mem::size_of::<ACCESS_ALLOWED_ACE>() + sid_size
+            - std::mem::size_of::<u32>()
+    }
+
+    fn acl_ptr(acl_words: &mut [u32]) -> *mut ACL {
+        acl_words.as_mut_ptr().cast::<ACL>()
+    }
+
+    fn build_security_descriptor(acl_words: &mut [u32]) -> std::io::Result<SECURITY_DESCRIPTOR> {
+        let acl = Self::acl_ptr(acl_words);
         let mut security_descriptor = unsafe { std::mem::zeroed::<SECURITY_DESCRIPTOR>() };
         SYSCALLS.initialize_security_descriptor(
             (&mut security_descriptor as *mut SECURITY_DESCRIPTOR).cast(),
@@ -170,7 +200,13 @@ impl NamedPipeSecurityDescriptor {
             (&mut security_descriptor as *mut SECURITY_DESCRIPTOR).cast(),
             acl,
         )?;
+        Ok(security_descriptor)
+    }
 
+    fn pin_descriptor(
+        security_descriptor: SECURITY_DESCRIPTOR,
+        acl_words: Vec<u32>,
+    ) -> Pin<Box<Self>> {
         let security_attributes = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: std::ptr::null_mut(),
@@ -188,12 +224,7 @@ impl NamedPipeSecurityDescriptor {
             this.security_attributes.lpSecurityDescriptor =
                 (&mut this.security_descriptor as *mut SECURITY_DESCRIPTOR).cast();
         }
-        Ok(descriptor)
-    }
-
-    fn as_mut_ptr(self: Pin<&mut Self>) -> *mut SECURITY_ATTRIBUTES {
-        let this = unsafe { self.get_unchecked_mut() };
-        &mut this.security_attributes
+        descriptor
     }
 }
 
@@ -780,7 +811,8 @@ impl Syscalls for RealSyscalls {
 #[cfg(test)]
 mod tests {
     use super::super::tests::support::{
-        BUFFER_SIZE, TestMeta, USED_SIZE, test_allocator, test_pair,
+        BUFFER_SIZE, TestMeta, USED_SIZE, test_address, test_allocator, test_pair,
+        test_transport_pair,
     };
     use super::*;
     use crate::{channels::MetadataEncoding, error::LavaFlowError};
@@ -861,15 +893,29 @@ mod tests {
             }
 
             fn current_logon_session_sid_words(&self) -> std::io::Result<Vec<u32>> {
-                RealSyscalls.current_logon_session_sid_words()
+                if should_fail("current_logon_session_sid_words") {
+                    Err(std::io::Error::other(
+                        "current_logon_session_sid_words failpoint",
+                    ))
+                } else {
+                    RealSyscalls.current_logon_session_sid_words()
+                }
             }
 
             fn well_known_sid_words(&self, sid_type: i32) -> std::io::Result<Vec<u32>> {
-                RealSyscalls.well_known_sid_words(sid_type)
+                if should_fail("well_known_sid_words") {
+                    Err(std::io::Error::other("well_known_sid_words failpoint"))
+                } else {
+                    RealSyscalls.well_known_sid_words(sid_type)
+                }
             }
 
             fn initialize_acl(&self, acl: *mut ACL, acl_size: u32) -> std::io::Result<()> {
-                RealSyscalls.initialize_acl(acl, acl_size)
+                if should_fail("InitializeAcl") {
+                    Err(std::io::Error::other("InitializeAcl failpoint"))
+                } else {
+                    RealSyscalls.initialize_acl(acl, acl_size)
+                }
             }
 
             fn add_access_allowed_ace(
@@ -878,14 +924,24 @@ mod tests {
                 access_mask: u32,
                 sid_words: &[u32],
             ) -> std::io::Result<()> {
-                RealSyscalls.add_access_allowed_ace(acl, access_mask, sid_words)
+                if should_fail("AddAccessAllowedAce") {
+                    Err(std::io::Error::other("AddAccessAllowedAce failpoint"))
+                } else {
+                    RealSyscalls.add_access_allowed_ace(acl, access_mask, sid_words)
+                }
             }
 
             fn initialize_security_descriptor(
                 &self,
                 security_descriptor: *mut core::ffi::c_void,
             ) -> std::io::Result<()> {
-                RealSyscalls.initialize_security_descriptor(security_descriptor)
+                if should_fail("InitializeSecurityDescriptor") {
+                    Err(std::io::Error::other(
+                        "InitializeSecurityDescriptor failpoint",
+                    ))
+                } else {
+                    RealSyscalls.initialize_security_descriptor(security_descriptor)
+                }
             }
 
             fn set_security_descriptor_dacl(
@@ -893,7 +949,11 @@ mod tests {
                 security_descriptor: *mut core::ffi::c_void,
                 acl: *mut ACL,
             ) -> std::io::Result<()> {
-                RealSyscalls.set_security_descriptor_dacl(security_descriptor, acl)
+                if should_fail("SetSecurityDescriptorDacl") {
+                    Err(std::io::Error::other("SetSecurityDescriptorDacl failpoint"))
+                } else {
+                    RealSyscalls.set_security_descriptor_dacl(security_descriptor, acl)
+                }
             }
 
             fn get_named_pipe_client_process_id(&self, handle: RawHandle) -> std::io::Result<u32> {
@@ -1005,6 +1065,293 @@ mod tests {
     }
 
     #[test]
+    fn current_logon_session_builder_reports_sid_lookup_failpoint() {
+        support::set_fail("current_logon_session_sid_words");
+
+        let err = match NamedPipeSecurityDescriptor::current_logon_session(
+            local_pipe_client_access_mask(),
+        ) {
+            Ok(_) => panic!("current logon session builder must surface sid lookup failure"),
+            Err(err) => err,
+        };
+        assert_eq!(err.to_string(), "current_logon_session_sid_words failpoint");
+    }
+
+    #[test]
+    fn everyone_builder_reports_sid_lookup_failpoint() {
+        support::set_fail("well_known_sid_words");
+
+        let err = match NamedPipeSecurityDescriptor::everyone(local_pipe_client_access_mask()) {
+            Ok(_) => panic!("everyone builder must surface sid lookup failure"),
+            Err(err) => err,
+        };
+        assert_eq!(err.to_string(), "well_known_sid_words failpoint");
+    }
+
+    #[test]
+    fn current_logon_session_builder_reports_initialize_acl_failpoint() {
+        support::set_fail("InitializeAcl");
+
+        let err = match NamedPipeSecurityDescriptor::current_logon_session(
+            local_pipe_client_access_mask(),
+        ) {
+            Ok(_) => panic!("builder must surface InitializeAcl failure"),
+            Err(err) => err,
+        };
+        assert_eq!(err.to_string(), "InitializeAcl failpoint");
+    }
+
+    #[test]
+    fn current_logon_session_builder_reports_add_access_allowed_ace_failpoint() {
+        support::set_fail("AddAccessAllowedAce");
+
+        let err = match NamedPipeSecurityDescriptor::current_logon_session(
+            local_pipe_client_access_mask(),
+        ) {
+            Ok(_) => panic!("builder must surface AddAccessAllowedAce failure"),
+            Err(err) => err,
+        };
+        assert_eq!(err.to_string(), "AddAccessAllowedAce failpoint");
+    }
+
+    #[test]
+    fn current_logon_session_builder_reports_initialize_security_descriptor_failpoint() {
+        support::set_fail("InitializeSecurityDescriptor");
+
+        let err = match NamedPipeSecurityDescriptor::current_logon_session(
+            local_pipe_client_access_mask(),
+        ) {
+            Ok(_) => panic!("builder must surface InitializeSecurityDescriptor failure"),
+            Err(err) => err,
+        };
+        assert_eq!(err.to_string(), "InitializeSecurityDescriptor failpoint");
+    }
+
+    #[test]
+    fn current_logon_session_builder_reports_set_security_descriptor_dacl_failpoint() {
+        support::set_fail("SetSecurityDescriptorDacl");
+
+        let err = match NamedPipeSecurityDescriptor::current_logon_session(
+            local_pipe_client_access_mask(),
+        ) {
+            Ok(_) => panic!("builder must surface SetSecurityDescriptorDacl failure"),
+            Err(err) => err,
+        };
+        assert_eq!(err.to_string(), "SetSecurityDescriptorDacl failpoint");
+    }
+
+    #[test]
+    fn bind_reports_create_named_pipe_failpoint() {
+        let address = test_address();
+        support::set_fail("CreateNamedPipeW");
+
+        let err = TransportListener::bind(&address)
+            .expect_err("bind must report CreateNamedPipeW failpoint");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "CreateNamedPipeW",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bind_reports_named_pipe_security_build_failpoint() {
+        let address = test_address();
+        support::set_fail("InitializeAcl");
+
+        let err = TransportListener::bind(&address)
+            .expect_err("bind must report security descriptor construction failure");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "build_named_pipe_security",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn connect_reports_create_file_failpoint() {
+        let address = test_address();
+        support::set_fail("CreateFileW");
+
+        let err = TransportReceiver::connect(&address)
+            .expect_err("connect must report CreateFileW failpoint");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "CreateFileW",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn accept_reports_connect_named_pipe_failpoint() {
+        let address = test_address();
+        let listener = TransportListener::bind(&address).expect("bind transport listener");
+        support::set_fail("ConnectNamedPipe");
+
+        let err = listener
+            .accept()
+            .expect_err("accept must report ConnectNamedPipe failpoint");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "ConnectNamedPipe",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn accept_reports_get_named_pipe_client_process_id_failpoint() {
+        let address = test_address();
+        let listener = TransportListener::bind(&address).expect("bind transport listener");
+        let receiver_address = address.clone();
+        let connect_thread = thread::spawn(move || {
+            TransportReceiver::connect(&receiver_address).expect("connect receiver")
+        });
+        support::set_fail("GetNamedPipeClientProcessId");
+
+        let err = listener
+            .accept()
+            .expect_err("accept must report GetNamedPipeClientProcessId failpoint");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "GetNamedPipeClientProcessId",
+                ..
+            }
+        ));
+        drop(
+            connect_thread
+                .join()
+                .expect("connect thread must not panic"),
+        );
+    }
+
+    #[test]
+    fn accept_reports_open_process_failpoint() {
+        let address = test_address();
+        let listener = TransportListener::bind(&address).expect("bind transport listener");
+        let receiver_address = address.clone();
+        let connect_thread = thread::spawn(move || {
+            TransportReceiver::connect(&receiver_address).expect("connect receiver")
+        });
+        support::set_fail("OpenProcess");
+
+        let err = listener
+            .accept()
+            .expect_err("accept must report OpenProcess failpoint");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "OpenProcess",
+                ..
+            }
+        ));
+        drop(
+            connect_thread
+                .join()
+                .expect("connect thread must not panic"),
+        );
+    }
+
+    #[test]
+    fn send_cpu_handle_rejects_overlapping_pending_transfer() {
+        let (mut sender, _receiver) = test_transport_pair().expect("create transport pair");
+        let first = test_allocator()
+            .allocate(BUFFER_SIZE)
+            .expect("allocate first payload");
+        let second = test_allocator()
+            .allocate(BUFFER_SIZE)
+            .expect("allocate second payload");
+
+        sender
+            .send_cpu_handle(first.shared_handle().expect("export first shared handle"))
+            .expect("start first handle transfer");
+        let err = sender
+            .send_cpu_handle(second.shared_handle().expect("export second shared handle"))
+            .expect_err("second transfer must be rejected while one is pending");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "send_cpu_handle",
+                ..
+            }
+        ));
+
+        sender.abort_transfer();
+    }
+
+    #[test]
+    fn send_cpu_handle_rejects_gpu_handle_for_cpu_ipc() {
+        let (mut sender, _receiver) = test_transport_pair().expect("create transport pair");
+        let gpu_allocator = match crate::memory::gpu::Allocator::new() {
+            Ok(allocator) => allocator,
+            Err(_) => return,
+        };
+        let buffer = gpu_allocator
+            .allocate(BUFFER_SIZE)
+            .expect("allocate gpu payload");
+
+        let err = sender
+            .send_cpu_handle(buffer.shared_handle().expect("export gpu handle"))
+            .expect_err("gpu handle must be rejected on cpu ipc transport");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "send_cpu_handle",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn recv_cpu_handle_rejects_invalid_handle_value() {
+        let (mut sender, mut receiver) = test_transport_pair().expect("create transport pair");
+        sender
+            .write_all(&u64::MAX.to_le_bytes())
+            .expect("write invalid raw handle value");
+        sender.flush().expect("flush invalid raw handle value");
+
+        let err = receiver
+            .recv_cpu_handle()
+            .expect_err("invalid handle value must be rejected");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "recv_cpu_handle",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn abort_transfer_best_effort_handles_remote_close_failpoint() {
+        let (mut sender, _receiver) = test_transport_pair().expect("create transport pair");
+        support::reset_remote_close_calls();
+        let buffer = test_allocator()
+            .allocate(BUFFER_SIZE)
+            .expect("allocate payload");
+
+        sender
+            .send_cpu_handle(buffer.shared_handle().expect("export shared handle"))
+            .expect("start pending transfer");
+        support::set_fail("DuplicateHandleCloseSource");
+        sender.abort_transfer();
+
+        assert_eq!(
+            support::remote_close_calls(),
+            1,
+            "abort_transfer should still attempt remote close when rollback itself fails",
+        );
+    }
+
+    #[test]
     fn allow_everyone_builder_allows_client_open() {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -1028,6 +1375,39 @@ mod tests {
         let client = SYSCALLS
             .open_named_pipe_client(address.as_str(), local_pipe_client_access_mask())
             .expect("open named pipe client with everyone dacl");
+
+        connect_thread
+            .join()
+            .expect("connect thread must not panic");
+        drop(client);
+    }
+
+    #[test]
+    fn current_logon_session_builder_allows_client_open() {
+        static COUNTER: AtomicU64 = AtomicU64::new(2);
+
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let channel_id =
+            ChannelId::new(format!("allow-current-logon-session-{id}")).expect("channel id");
+        let address = EndpointAddress::from_channel(&channel_id);
+
+        let mut security =
+            NamedPipeSecurityDescriptor::current_logon_session(local_pipe_client_access_mask())
+                .expect("build current-logon-session security descriptor");
+
+        let server = SYSCALLS
+            .create_named_pipe(address.as_str(), Some(security.as_mut()))
+            .expect("create named pipe with current-logon-session dacl");
+        let server_handle = server.as_raw_handle() as usize;
+        let connect_thread = thread::spawn(move || {
+            SYSCALLS
+                .connect_named_pipe(server_handle as RawHandle)
+                .expect("connect named pipe");
+        });
+
+        let client = SYSCALLS
+            .open_named_pipe_client(address.as_str(), local_pipe_client_access_mask())
+            .expect("open named pipe client with current-logon-session dacl");
 
         connect_thread
             .join()

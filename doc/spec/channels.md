@@ -168,6 +168,15 @@ Per-message flow:
 This means `send()` is synchronous at the protocol level: it completes only after the receiver has
 either accepted the imported handle or rejected it.
 
+Local envelope size limits:
+
+- local transports enforce explicit payload-size and metadata-size limits on both send and receive
+- oversized envelopes are rejected before metadata allocation or shared-memory import
+- the current defaults are:
+  - payload: `1 GiB`
+  - metadata: `1 MiB`
+- the local sender/listener and receiver are constructed with those limits explicitly
+
 ## Current Local Security
 
 Phase 3 local security is transport-specific and currently implemented as follows.
@@ -183,9 +192,12 @@ Unix:
 
 - local CPU IPC uses Unix-domain sockets with `SCM_RIGHTS` for fd transfer
 - the socket path is derived under a private per-user runtime directory
-- `XDG_RUNTIME_DIR/lava-flow/` is preferred when available
-- the fallback is a per-user directory under the system temp directory
+- `LAVA_FLOW_RUNTIME_DIR` is preferred as an explicit override for orchestrated/container setups
+- otherwise `XDG_RUNTIME_DIR/lava-flow/` is used when available
+- if `XDG_RUNTIME_DIR` is unset, `/run/user/<uid>/lava-flow/` is used when that runtime base exists
+- otherwise the fallback is `$HOME/.local/run/lava-flow/`
 - the runtime directory is created with `0700` permissions before bind
+- the runtime directory must not be a symlink and must be owned by the effective user
 
 These measures reduce cross-user access to local IPC endpoints before the later shared-secret
 challenge/response hardening is added.

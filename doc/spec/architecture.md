@@ -69,6 +69,8 @@ Key points:
 - Metadata always carries `used_size` for payload validity.
 - Current local transports use a versioned tagged binary control protocol with receiver import
   acknowledgment before `send()` completes.
+- Current local transports also enforce configurable envelope-size limits before metadata allocation
+  or shared-memory import.
 
 ## Transport Routing
 
@@ -124,9 +126,27 @@ Current local transport hardening is platform-specific:
 - Windows named pipes are created with an explicit current-logon-session DACL rather than the
   default descriptor, and the current implementation uses one duplex pipe per local channel.
 - Unix-domain sockets live under a private per-user runtime directory, not directly under `/tmp`.
+- For Unix runtime-dir resolution, the current order is:
+  - `LAVA_FLOW_RUNTIME_DIR`
+  - `XDG_RUNTIME_DIR/lava-flow/`
+  - `/run/user/<uid>/lava-flow/` when available
+  - `$HOME/.local/run/lava-flow/`
+- The Unix runtime directory is validated as a real directory, not a symlink, owned by the
+  effective user, and forced to `0700`.
 
 This is the current baseline before later peer validation and shared-secret challenge/response are
 added on top.
+
+## Current Local Protocol Limits
+
+Current local CPU IPC rejects oversized envelopes before allocating metadata buffers or importing
+shared-memory payloads.
+
+- default payload cap: `1 GiB`
+- default metadata cap: `1 MiB`
+- limits are configured when the local sender/listener and receiver are constructed
+- later builder defaults should supply those values rather than relying on process-global
+  environment state
 
 ## Related Docs
 

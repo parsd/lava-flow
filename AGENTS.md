@@ -31,6 +31,7 @@ If any step cannot be run, explain why and what would be required to run it.
 
 - Strive for 100% line and function coverage for core logic.
 - Region coverage may be lower due to compiler/instrumentation granularity; treat it as a guidance metric, not a hard gate.
+- Windows and WSL coverage must keep separate CARGO_TARGET_DIRs. Mixed target directories will corrupt the report inputs.
 
 ## License Policy
 
