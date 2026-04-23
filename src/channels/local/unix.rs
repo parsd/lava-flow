@@ -477,7 +477,7 @@ mod tests {
     use super::super::tests::support::{
         BUFFER_SIZE, TestMeta, USED_SIZE, test_allocator, test_pair, test_transport_pair,
     };
-    use super::super::{CpuReceiver, LocalProtocolLimits, ProtocolTag};
+    use super::super::{LocalProtocolLimits, ProtocolTag, Receiver};
     use super::*;
     use crate::test_support::env::Guard as EnvGuard;
     use crate::{channels::MetadataEncoding, error::LavaFlowError};
@@ -955,7 +955,7 @@ mod tests {
     fn recv_reports_import_failure_and_sends_import_failed_ack_for_invalid_cpu_handle() {
         let (mut sender_transport, receiver_transport) =
             test_transport_pair().expect("create transport pair");
-        let mut receiver = CpuReceiver::new(
+        let mut receiver = Receiver::new(
             MetadataEncoding::Json,
             receiver_transport,
             LocalProtocolLimits::default(),
@@ -998,7 +998,7 @@ mod tests {
     fn recv_map_reports_import_failure_and_sends_import_failed_ack_for_invalid_cpu_handle() {
         let (mut sender_transport, receiver_transport) =
             test_transport_pair().expect("create transport pair");
-        let mut receiver = CpuReceiver::new(
+        let mut receiver = Receiver::new(
             MetadataEncoding::Json,
             receiver_transport,
             LocalProtocolLimits::default(),

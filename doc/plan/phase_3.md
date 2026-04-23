@@ -25,6 +25,35 @@ targets point-to-point local channels first.
 - Lightweight endpoint introspection (`scope()`, `receive_representation()`)
 - Local-only tests and benchmarks
 
+## Current Implementation State
+
+Implemented now:
+
+- internal local bootstrap with deterministic endpoint naming from `ChannelId`
+- `Sender` / `Receiver` local runtime for point-to-point CPU shared-memory transport
+- versioned tagged local control protocol
+- explicit receiver import `ImportOk` / `ImportFailed` ACK/NACK
+- configurable local protocol size limits:
+  - payload cap
+  - metadata cap
+- Windows local access control:
+  - duplex named pipe
+  - explicit current-logon-session DACL
+- Unix local access control:
+  - private per-user runtime directory
+  - secure fallback order:
+    - `LAVA_FLOW_RUNTIME_DIR`
+    - `XDG_RUNTIME_DIR/lava-flow/`
+    - `/run/user/<uid>/lava-flow/`
+    - `$HOME/.local/run/lava-flow/`
+
+Not implemented yet:
+
+- public `ChannelBuilder::sender(...)` / `ChannelBuilder::receiver(...)`
+- GPU local handle transfer and Vulkan IPC transport wiring
+- true inter-process CPU and GPU test coverage
+- bootstrap authentication and optional peer-identity validation
+
 ## Phase Ordering
 
 Implementation should proceed in this order:
@@ -35,8 +64,8 @@ Implementation should proceed in this order:
 4. Local point-to-point Vulkan IPC transport implementation.
 5. True inter-process tests for CPU and GPU local IPC paths.
 6. Local bootstrap hardening:
-   - OS peer validation during connection establishment
-   - optional shared-secret challenge/response before any handle transfer or message I/O
+   - optional OS peer validation during connection establishment
+   - shared-secret HMAC challenge/response before any handle transfer or message I/O
 
 Rationale:
 
@@ -90,8 +119,8 @@ flowchart LR
     B[ReceiverBuilder inputs] --> C
     C --> D[local listener]
     C --> E[local connector]
-    D --> F[accepted CpuSender]
-    E --> G[connected CpuReceiver]
+    D --> F[accepted local Sender]
+    E --> G[connected local Receiver]
 ```
 
 ### Builder Assumption
@@ -135,6 +164,9 @@ introduced:
   - the local sender/listener and receiver are constructed with explicit limits
   - later builder defaults should provide those values at the public API boundary
 
+This is the currently implemented baseline. It reduces cross-user access and bounds envelope
+resource use, but it does not yet authenticate that the connected peer is the intended process.
+
 ### Current Phase 3 Default
 
 For local point-to-point transport bootstrap, the current default should be:
@@ -173,15 +205,31 @@ the initial local transport bring-up.
 
 Recommended shape:
 
-- perform OS-level peer validation during local connection establishment
-  - Unix: peer credentials on connected Unix sockets
-  - Windows: peer PID validation on connected named pipes
-- optionally perform application-level mutual authentication using a shared secret
-- run this authentication step before any handle transfer or channel message I/O
+- primary authentication mechanism:
+  - nonce-based challenge/response using a shared secret
+  - HMAC over a bootstrap transcript including at least:
+    - role
+    - `ChannelId`
+    - both nonces
+    - local protocol version
+- authentication must complete before any handle transfer or channel message I/O
+- optional OS peer validation should be supported as a pre-auth filter:
+  - Unix:
+    - `SameUser`
+    - peer credentials on connected Unix sockets
+    - optional expected `ProcessId`
+  - Windows:
+    - current logon session remains the access-control baseline
+    - optional expected `ProcessId` from connected named-pipe peer APIs
 
-The preferred application-level mechanism is a nonce-based challenge/response using a shared secret,
-so malicious same-user processes that do not know the secret can be rejected even if they can reach
-the endpoint name.
+Rationale:
+
+- shared-secret HMAC challenge/response is the primary defense against malicious same-user or
+  same-session processes that can still reach the endpoint name
+- optional `SameUser` / `ProcessId` checks are defense-in-depth and pre-auth filtering, not the
+  main authentication mechanism
+- `ProcessId` is useful for orchestrated cases where the caller already knows the peer PID, but it
+  should stay optional because PIDs are ephemeral and app-supplied
 
 ## Encapsulation Boundary
 

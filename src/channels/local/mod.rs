@@ -222,13 +222,13 @@ impl TryFrom<u8> for FrameKind {
 /// payload bytes stay in shared memory and are referenced through an exported CPU handle.
 #[derive(Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct CpuSender {
+pub(crate) struct Sender {
     encoding: MetadataEncoding,
     transport: platform::TransportSender,
     limits: LocalProtocolLimits,
 }
 
-impl CpuSender {
+impl Sender {
     fn new(
         encoding: MetadataEncoding,
         transport: platform::TransportSender,
@@ -246,8 +246,8 @@ impl CpuSender {
         encoding: MetadataEncoding,
         address: &EndpointAddress,
         limits: LocalProtocolLimits,
-    ) -> Result<CpuSenderListener> {
-        Ok(CpuSenderListener {
+    ) -> Result<SenderListener> {
+        Ok(SenderListener {
             encoding,
             listener: platform::TransportListener::bind(address)?,
             limits,
@@ -326,31 +326,31 @@ impl CpuSender {
 
 #[derive(Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct CpuSenderListener {
+pub(crate) struct SenderListener {
     encoding: MetadataEncoding,
     listener: platform::TransportListener,
     limits: LocalProtocolLimits,
 }
 
-impl CpuSenderListener {
+impl SenderListener {
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn accept(self) -> Result<CpuSender> {
+    pub(crate) fn accept(self) -> Result<Sender> {
         let mut transport = self.listener.accept()?;
         ConnectionHeader::from_encoding(self.encoding).write_to(&mut transport)?;
-        Ok(CpuSender::new(self.encoding, transport, self.limits))
+        Ok(Sender::new(self.encoding, transport, self.limits))
     }
 }
 
 /// Receiver half of the local CPU IPC transport.
 #[derive(Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct CpuReceiver {
+pub(crate) struct Receiver {
     encoding: MetadataEncoding,
     limits: LocalProtocolLimits,
     transport: platform::TransportReceiver,
 }
 
-impl CpuReceiver {
+impl Receiver {
     fn new(
         encoding: MetadataEncoding,
         transport: platform::TransportReceiver,
@@ -449,6 +449,10 @@ impl MessageEnvelope {
         })?;
         let kind = FrameKind::from_handle(&handle);
 
+        // TODO: add a generic send_handle() dispatch here once local GPU handle transfer is
+        // implemented. That generic entry point should select backend-specific
+        // send_cpu_handle()/send_gpu_handle() methods because the rights and transfer mechanics
+        // differ by handle kind and platform.
         transport.write_all(&[ProtocolTag::MessageEnvelope as u8, kind as u8])?;
         transport.write_all(&payload_size.to_le_bytes())?;
         transport.send_cpu_handle(handle)?;
@@ -480,6 +484,9 @@ impl MessageEnvelope {
         })?;
         limits.validate_inbound_payload_size(size)?;
 
+        // TODO: add a generic recv_handle() dispatch here once local GPU handle transfer is
+        // implemented. The generic path should validate the frame kind tag and then call
+        // recv_cpu_handle()/recv_gpu_handle() as appropriate for the transferred handle class.
         let handle = transport.recv_cpu_handle()?;
         if FrameKind::from_handle(&handle) != kind {
             return Err(channel_protocol_error(
@@ -517,6 +524,8 @@ impl MessageEnvelope {
     }
 
     fn try_into_frame(&self) -> Result<Frame> {
+        // TODO: import GPU-backed frames here once the local transport grows recv_gpu_handle()
+        // support and the Vulkan IPC path is wired into channels::local.
         match FrameKind::from_handle(&self.handle) {
             FrameKind::Cpu => {
                 let buffer =
@@ -545,6 +554,9 @@ impl MessageEnvelope {
     }
 
     fn export_frame(frame: Frame) -> Result<(usize, InterprocessMemoryHandle)> {
+        // TODO: export GPU-backed frames here once the generic local transport grows a
+        // send_gpu_handle() path. For now channels::local remains CPU-only at the handle-transfer
+        // layer even though the protocol already reserves a GPU frame-kind tag.
         match frame {
             Frame::Cpu(buffer) => Ok((buffer.size(), buffer.shared_handle()?)),
             Frame::Gpu(_) => Err(LavaFlowError::UnsupportedChannelBufferKind { kind: "gpu" }),
@@ -629,12 +641,12 @@ mod tests {
 
         pub(in crate::channels::local) fn test_pair(
             encoding: MetadataEncoding,
-        ) -> Result<(CpuSender, CpuReceiver)> {
+        ) -> Result<(Sender, Receiver)> {
             let address = test_address();
-            let listener = CpuSender::listen(encoding, &address, LocalProtocolLimits::default())?;
+            let listener = Sender::listen(encoding, &address, LocalProtocolLimits::default())?;
             let receiver_address = address.clone();
             let receiver_thread = thread::spawn(move || {
-                CpuReceiver::connect(&receiver_address, LocalProtocolLimits::default())
+                Receiver::connect(&receiver_address, LocalProtocolLimits::default())
             });
             let sender = listener.accept()?;
             let receiver = receiver_thread
@@ -894,7 +906,7 @@ mod tests {
         let listener = platform::TransportListener::bind(&address).expect("bind transport");
         let receiver_address = address.clone();
         let receiver_thread = thread::spawn(move || {
-            CpuReceiver::connect(&receiver_address, LocalProtocolLimits::default())
+            Receiver::connect(&receiver_address, LocalProtocolLimits::default())
         });
 
         let mut sender_transport = listener.accept().expect("accept transport");
@@ -970,7 +982,7 @@ mod tests {
     fn sender_reports_import_failed_ack() {
         let (sender_transport, mut receiver_transport) =
             test_transport_pair().expect("create transport pair");
-        let mut sender = CpuSender::new(
+        let mut sender = Sender::new(
             MetadataEncoding::Json,
             sender_transport,
             LocalProtocolLimits::default(),
@@ -1010,7 +1022,7 @@ mod tests {
     fn sender_rejects_unexpected_import_ack_tag() {
         let (sender_transport, mut receiver_transport) =
             test_transport_pair().expect("create transport pair");
-        let mut sender = CpuSender::new(
+        let mut sender = Sender::new(
             MetadataEncoding::Json,
             sender_transport,
             LocalProtocolLimits::default(),
@@ -1453,7 +1465,7 @@ mod tests {
     fn recv_reports_import_failure_and_sends_import_failed_ack_for_invalid_cpu_handle() {
         let (mut sender_transport, receiver_transport) =
             test_transport_pair().expect("create transport pair");
-        let mut receiver = CpuReceiver::new(
+        let mut receiver = Receiver::new(
             MetadataEncoding::Json,
             receiver_transport,
             LocalProtocolLimits::default(),
@@ -1504,7 +1516,7 @@ mod tests {
     fn recv_map_reports_import_failure_and_sends_import_failed_ack_for_invalid_cpu_handle() {
         let (mut sender_transport, receiver_transport) =
             test_transport_pair().expect("create transport pair");
-        let mut receiver = CpuReceiver::new(
+        let mut receiver = Receiver::new(
             MetadataEncoding::Json,
             receiver_transport,
             LocalProtocolLimits::default(),
