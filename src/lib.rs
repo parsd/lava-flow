@@ -1,4 +1,4 @@
-pub mod channels;
+pub mod channel;
 pub mod error;
 pub mod memory;
 #[cfg(test)]

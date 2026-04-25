@@ -58,7 +58,7 @@ pub enum Frame {
     Gpu(gpu::MemoryBuffer),
 }
 
-pub trait ChannelMetadata: Serialize + DeserializeOwned {
+pub trait Metadata: Serialize + DeserializeOwned {
     fn used_size(&self) -> usize;
 }
 
@@ -70,7 +70,7 @@ pub enum ReceiveRepresentation {
 impl Sender {
     pub fn send<M, F>(&self, frame: F, metadata: &M) -> Result<()>
     where
-        M: ChannelMetadata,
+        M: Metadata,
         F: Into<Frame>;
     pub fn send_map<F>(&self, frame: F, metadata: MessageMeta) -> Result<()>
     where
@@ -79,7 +79,7 @@ impl Sender {
 }
 
 impl Receiver {
-    pub fn recv<M: ChannelMetadata>(&self) -> Result<(Frame, M)>;
+    pub fn recv<M: Metadata>(&self) -> Result<(Frame, M)>;
     pub fn recv_map(&self) -> Result<(Frame, MessageMeta)>;
     pub fn scope(&self) -> CommunicationScope;
     pub fn receive_representation(&self) -> ReceiveRepresentation;
@@ -336,8 +336,8 @@ pub struct MessageMeta {
 
 Typed metadata remains serde-driven:
 
-- send typed: `M: ChannelMetadata`
-- receive typed: `M: ChannelMetadata`
+- send typed: `M: Metadata`
+- receive typed: `M: Metadata`
 - receive dynamic: `MessageMeta` via `recv_map()`
 
 Metadata contract:

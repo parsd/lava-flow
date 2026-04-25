@@ -42,7 +42,7 @@ impl TryFrom<u8> for MetadataEncoding {
 }
 
 /// User-defined typed metadata contract for channel payloads.
-pub trait ChannelMetadata: Serialize + DeserializeOwned {
+pub trait Metadata: Serialize + DeserializeOwned {
     /// Returns the number of payload bytes that are valid for this message.
     fn used_size(&self) -> usize;
 }
@@ -77,7 +77,7 @@ pub struct MessageMeta {
     pub values: BTreeMap<String, MetaValue>,
 }
 
-impl ChannelMetadata for MessageMeta {
+impl Metadata for MessageMeta {
     fn used_size(&self) -> usize {
         self.used_size
     }

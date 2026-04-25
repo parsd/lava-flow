@@ -1,4 +1,4 @@
-use super::{ChannelMetadata, Frame, MessageMeta, MetadataEncoding};
+use super::{Frame, MessageMeta, Metadata, MetadataEncoding};
 use crate::error::{LavaFlowError, Result};
 use crate::memory::allocator::InterprocessMemoryHandle;
 use crate::memory::cpu;
@@ -259,7 +259,7 @@ impl Sender {
     pub(crate) fn send<F, M>(&mut self, frame: F, metadata: &M) -> Result<()>
     where
         F: Into<Frame>,
-        M: ChannelMetadata,
+        M: Metadata,
     {
         let envelope = MessageEnvelope::from_frame_and_metadata(
             frame.into(),
@@ -372,7 +372,7 @@ impl Receiver {
 
     /// Receives a payload frame with typed metadata through local CPU IPC.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn recv<M: ChannelMetadata>(&mut self) -> Result<(Frame, M)> {
+    pub(crate) fn recv<M: Metadata>(&mut self) -> Result<(Frame, M)> {
         let message = MessageEnvelope::read_from(&mut self.transport, self.limits)?;
         let frame = match message.try_into_frame() {
             Ok(frame) => {
@@ -420,7 +420,7 @@ struct MessageEnvelope {
 }
 
 impl MessageEnvelope {
-    fn from_frame_and_metadata<M: ChannelMetadata>(
+    fn from_frame_and_metadata<M: Metadata>(
         frame: Frame,
         encoding: MetadataEncoding,
         metadata: &M,
@@ -509,7 +509,7 @@ impl MessageEnvelope {
         })
     }
 
-    fn decode_metadata<M: ChannelMetadata>(&self, encoding: MetadataEncoding) -> Result<M> {
+    fn decode_metadata<M: Metadata>(&self, encoding: MetadataEncoding) -> Result<M> {
         match encoding {
             MetadataEncoding::Json => serde_json::from_slice(&self.metadata).map_err(|source| {
                 LavaFlowError::ChannelMetadataCodec {
@@ -525,7 +525,7 @@ impl MessageEnvelope {
 
     fn try_into_frame(&self) -> Result<Frame> {
         // TODO: import GPU-backed frames here once the local transport grows recv_gpu_handle()
-        // support and the Vulkan IPC path is wired into channels::local.
+        // support and the Vulkan IPC path is wired into channel::local.
         match FrameKind::from_handle(&self.handle) {
             FrameKind::Cpu => {
                 let buffer =
@@ -536,10 +536,7 @@ impl MessageEnvelope {
         }
     }
 
-    fn encode_metadata<M: ChannelMetadata>(
-        encoding: MetadataEncoding,
-        metadata: &M,
-    ) -> Result<Vec<u8>> {
+    fn encode_metadata<M: Metadata>(encoding: MetadataEncoding, metadata: &M) -> Result<Vec<u8>> {
         match encoding {
             MetadataEncoding::Json => {
                 serde_json::to_vec(metadata).map_err(|source| LavaFlowError::ChannelMetadataCodec {
@@ -555,7 +552,7 @@ impl MessageEnvelope {
 
     fn export_frame(frame: Frame) -> Result<(usize, InterprocessMemoryHandle)> {
         // TODO: export GPU-backed frames here once the generic local transport grows a
-        // send_gpu_handle() path. For now channels::local remains CPU-only at the handle-transfer
+        // send_gpu_handle() path. For now channel::local remains CPU-only at the handle-transfer
         // layer even though the protocol already reserves a GPU frame-kind tag.
         match frame {
             Frame::Cpu(buffer) => Ok((buffer.size(), buffer.shared_handle()?)),
@@ -585,33 +582,33 @@ fn channel_protocol_error(operation: &'static str, message: &'static str) -> Lav
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::MetaValue;
+    use crate::channel::MetaValue;
     use crate::types::ChannelId;
     use serde::{Deserialize, Serialize, Serializer};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
 
-    pub(in crate::channels::local) mod support {
+    pub(in crate::channel::local) mod support {
         use super::*;
 
         #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-        pub(in crate::channels::local) struct TestMeta {
-            pub(in crate::channels::local) used_size: usize,
-            pub(in crate::channels::local) width: u32,
-            pub(in crate::channels::local) height: u32,
+        pub(in crate::channel::local) struct TestMeta {
+            pub(in crate::channel::local) used_size: usize,
+            pub(in crate::channel::local) width: u32,
+            pub(in crate::channel::local) height: u32,
         }
 
-        impl ChannelMetadata for TestMeta {
+        impl Metadata for TestMeta {
             fn used_size(&self) -> usize {
                 self.used_size
             }
         }
 
         #[derive(Clone, Debug, Deserialize)]
-        pub(in crate::channels::local) struct FailingMeta;
+        pub(in crate::channel::local) struct FailingMeta;
 
-        impl ChannelMetadata for FailingMeta {
+        impl Metadata for FailingMeta {
             fn used_size(&self) -> usize {
                 0
             }
@@ -626,12 +623,12 @@ mod tests {
             }
         }
 
-        pub(in crate::channels::local) const BUFFER_SIZE: usize = 64;
-        pub(in crate::channels::local) const USED_SIZE: usize = 17;
-        pub(in crate::channels::local) const TEST_BYTE_OFFSET: usize = 7;
-        pub(in crate::channels::local) const TEST_BYTE_VALUE: u8 = 0x5a;
+        pub(in crate::channel::local) const BUFFER_SIZE: usize = 64;
+        pub(in crate::channel::local) const USED_SIZE: usize = 17;
+        pub(in crate::channel::local) const TEST_BYTE_OFFSET: usize = 7;
+        pub(in crate::channel::local) const TEST_BYTE_VALUE: u8 = 0x5a;
 
-        pub(in crate::channels::local) fn test_address() -> EndpointAddress {
+        pub(in crate::channel::local) fn test_address() -> EndpointAddress {
             static COUNTER: AtomicU64 = AtomicU64::new(1);
 
             let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -639,7 +636,7 @@ mod tests {
             EndpointAddress::from_test_channel(&channel_id)
         }
 
-        pub(in crate::channels::local) fn test_pair(
+        pub(in crate::channel::local) fn test_pair(
             encoding: MetadataEncoding,
         ) -> Result<(Sender, Receiver)> {
             let address = test_address();
@@ -655,7 +652,7 @@ mod tests {
             Ok((sender, receiver))
         }
 
-        pub(in crate::channels::local) fn test_transport_pair()
+        pub(in crate::channel::local) fn test_transport_pair()
         -> Result<(platform::TransportSender, platform::TransportReceiver)> {
             let address = test_address();
             let listener = platform::TransportListener::bind(&address)?;
@@ -669,7 +666,7 @@ mod tests {
             Ok((sender, receiver))
         }
 
-        pub(in crate::channels::local) fn test_allocator() -> cpu::Allocator {
+        pub(in crate::channel::local) fn test_allocator() -> cpu::Allocator {
             cpu::Allocator::with_max_allocation_size(usize::MAX)
         }
     }

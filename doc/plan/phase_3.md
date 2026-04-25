@@ -86,7 +86,7 @@ Rationale:
 - `ChannelAllocator` trait with fixed-target allocation-only implementations
 - No `src/memory/unified.rs` planning; allocator composition stays in traits/builders and existing module boundaries
 - Payload frame type (`Frame`) without embedded metadata
-- Metadata contract (`ChannelMetadata` + `MessageMeta`) with mandatory `used_size`
+- Metadata contract (`Metadata` + `MessageMeta`) with mandatory `used_size`
 - Receiver-level `ReceiveRepresentation` (`ExternalShare`, `Materialized`)
 - Sender-side metadata serialization configuration (codec selection), propagated during connect
 - `VulkanIpcTransport`

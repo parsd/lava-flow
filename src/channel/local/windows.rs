@@ -33,7 +33,7 @@ impl EndpointAddress {
     }
 
     #[cfg(test)]
-    pub(in crate::channels::local) fn from_test_channel(channel_id: &ChannelId) -> Self {
+    pub(in crate::channel::local) fn from_test_channel(channel_id: &ChannelId) -> Self {
         Self::from_channel(channel_id)
     }
 
@@ -815,11 +815,11 @@ mod tests {
         test_transport_pair,
     };
     use super::*;
-    use crate::{channels::MetadataEncoding, error::LavaFlowError};
+    use crate::{channel::MetadataEncoding, error::LavaFlowError};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
 
-    pub(in crate::channels::local) mod support {
+    pub(in crate::channel::local) mod support {
         use super::*;
 
         thread_local! {
@@ -827,13 +827,13 @@ mod tests {
             static REMOTE_CLOSE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
 
-        pub(in crate::channels::local) fn set_fail(op: &'static str) {
+        pub(in crate::channel::local) fn set_fail(op: &'static str) {
             FAIL_OP_WINDOWS.with(|cell| {
                 *cell.borrow_mut() = Some(op);
             });
         }
 
-        pub(in crate::channels::local) fn should_fail(op: &'static str) -> bool {
+        pub(in crate::channel::local) fn should_fail(op: &'static str) -> bool {
             FAIL_OP_WINDOWS.with(|cell| {
                 let mut current = cell.borrow_mut();
                 if current.as_ref() == Some(&op) {
@@ -845,15 +845,15 @@ mod tests {
             })
         }
 
-        pub(in crate::channels::local) fn reset_remote_close_calls() {
+        pub(in crate::channel::local) fn reset_remote_close_calls() {
             REMOTE_CLOSE_CALLS.with(|cell| cell.set(0));
         }
 
-        pub(in crate::channels::local) fn remote_close_calls() -> u32 {
+        pub(in crate::channel::local) fn remote_close_calls() -> u32 {
             REMOTE_CLOSE_CALLS.with(|cell| cell.get())
         }
 
-        pub(in crate::channels::local) struct MockSyscalls;
+        pub(in crate::channel::local) struct MockSyscalls;
 
         impl Syscalls for MockSyscalls {
             fn create_named_pipe(

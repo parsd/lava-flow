@@ -33,7 +33,7 @@ impl EndpointAddress {
     }
 
     #[cfg(test)]
-    pub(in crate::channels::local) fn from_test_channel(channel_id: &ChannelId) -> Self {
+    pub(in crate::channel::local) fn from_test_channel(channel_id: &ChannelId) -> Self {
         let path = env::temp_dir()
             .join(format!("lava-flow-tests-{}", std::process::id()))
             .join(format!("{}.sock", channel_id.as_str()));
@@ -480,19 +480,19 @@ mod tests {
     use super::super::{LocalProtocolLimits, ProtocolTag, Receiver};
     use super::*;
     use crate::test_support::env::Guard as EnvGuard;
-    use crate::{channels::MetadataEncoding, error::LavaFlowError};
+    use crate::{channel::MetadataEncoding, error::LavaFlowError};
     use std::collections::BTreeMap;
     use std::os::fd::FromRawFd;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    pub(in crate::channels::local) mod support {
+    pub(in crate::channel::local) mod support {
         use super::*;
 
         thread_local! {
             static FAIL_OP_UNIX: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
         }
 
-        pub(in crate::channels::local) fn set_fail(op: &'static str) {
+        pub(in crate::channel::local) fn set_fail(op: &'static str) {
             FAIL_OP_UNIX.with(|cell| {
                 *cell.borrow_mut() = Some(op);
             });
@@ -510,7 +510,7 @@ mod tests {
             })
         }
 
-        pub(in crate::channels::local) struct MockSyscalls;
+        pub(in crate::channel::local) struct MockSyscalls;
 
         impl Syscalls for MockSyscalls {
             fn sendmsg(
@@ -1003,7 +1003,7 @@ mod tests {
             receiver_transport,
             LocalProtocolLimits::default(),
         );
-        let metadata = serde_json::to_vec(&crate::channels::MessageMeta {
+        let metadata = serde_json::to_vec(&crate::channel::MessageMeta {
             used_size: USED_SIZE,
             values: BTreeMap::new(),
         })
