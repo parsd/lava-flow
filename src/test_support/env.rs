@@ -58,41 +58,43 @@ impl Drop for Guard {
 mod tests {
     use super::*;
 
-    const KEY_RESTORE: &str = "LAVA_FLOW_TEST_ENV_GUARD_KEY_RESTORE";
-    const KEY_ABSENT: &str = "LAVA_FLOW_TEST_ENV_GUARD_KEY_ABSENT";
+    const KEY_SET_RESTORE: &str = "LAVA_FLOW_TEST_ENV_GUARD_KEY_SET_RESTORE";
+    const KEY_SET_ABSENT: &str = "LAVA_FLOW_TEST_ENV_GUARD_KEY_SET_ABSENT";
+    const KEY_UNSET_RESTORE: &str = "LAVA_FLOW_TEST_ENV_GUARD_KEY_UNSET_RESTORE";
+    const KEY_POISONED: &str = "LAVA_FLOW_TEST_ENV_GUARD_KEY_POISONED";
     const ORIGINAL: &str = "original";
     const TEMP: &str = "temporary";
 
     #[test]
     fn guard_restores_previous_value() {
-        unsafe { std::env::set_var(KEY_RESTORE, ORIGINAL) };
+        unsafe { std::env::set_var(KEY_SET_RESTORE, ORIGINAL) };
         {
-            let _guard = Guard::set(KEY_RESTORE, TEMP);
-            assert_eq!(std::env::var(KEY_RESTORE).as_deref(), Ok(TEMP));
+            let _guard = Guard::set(KEY_SET_RESTORE, TEMP);
+            assert_eq!(std::env::var(KEY_SET_RESTORE).as_deref(), Ok(TEMP));
         }
-        assert_eq!(std::env::var(KEY_RESTORE).as_deref(), Ok(ORIGINAL));
-        unsafe { std::env::remove_var(KEY_RESTORE) };
+        assert_eq!(std::env::var(KEY_SET_RESTORE).as_deref(), Ok(ORIGINAL));
+        unsafe { std::env::remove_var(KEY_SET_RESTORE) };
     }
 
     #[test]
     fn guard_removes_value_when_key_was_absent() {
-        unsafe { std::env::remove_var(KEY_ABSENT) };
+        unsafe { std::env::remove_var(KEY_SET_ABSENT) };
         {
-            let _guard = Guard::set(KEY_ABSENT, TEMP);
-            assert_eq!(std::env::var(KEY_ABSENT).as_deref(), Ok(TEMP));
+            let _guard = Guard::set(KEY_SET_ABSENT, TEMP);
+            assert_eq!(std::env::var(KEY_SET_ABSENT).as_deref(), Ok(TEMP));
         }
-        assert!(std::env::var(KEY_ABSENT).is_err());
+        assert!(std::env::var(KEY_SET_ABSENT).is_err());
     }
 
     #[test]
     fn guard_unset_restores_previous_value() {
-        unsafe { std::env::set_var(KEY_RESTORE, ORIGINAL) };
+        unsafe { std::env::set_var(KEY_UNSET_RESTORE, ORIGINAL) };
         {
-            let _guard = Guard::unset(KEY_RESTORE);
-            assert!(std::env::var(KEY_RESTORE).is_err());
+            let _guard = Guard::unset(KEY_UNSET_RESTORE);
+            assert!(std::env::var(KEY_UNSET_RESTORE).is_err());
         }
-        assert_eq!(std::env::var(KEY_RESTORE).as_deref(), Ok(ORIGINAL));
-        unsafe { std::env::remove_var(KEY_RESTORE) };
+        assert_eq!(std::env::var(KEY_UNSET_RESTORE).as_deref(), Ok(ORIGINAL));
+        unsafe { std::env::remove_var(KEY_UNSET_RESTORE) };
     }
 
     #[test]
@@ -102,11 +104,11 @@ mod tests {
             panic!("poison env mutex");
         });
 
-        unsafe { std::env::remove_var(KEY_ABSENT) };
+        unsafe { std::env::remove_var(KEY_POISONED) };
         {
-            let _guard = Guard::set(KEY_ABSENT, TEMP);
-            assert_eq!(std::env::var(KEY_ABSENT).as_deref(), Ok(TEMP));
+            let _guard = Guard::set(KEY_POISONED, TEMP);
+            assert_eq!(std::env::var(KEY_POISONED).as_deref(), Ok(TEMP));
         }
-        assert!(std::env::var(KEY_ABSENT).is_err());
+        assert!(std::env::var(KEY_POISONED).is_err());
     }
 }

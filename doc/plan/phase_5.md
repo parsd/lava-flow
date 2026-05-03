@@ -22,10 +22,9 @@ workflow so sync is implicit for users.
 ## Example (API Shape)
 
 ```rust
-let tx = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone()).build()?;
-let rx = ChannelBuilder::receiver(my_loc, peer_loc)
-    .with_allocator(gpu_allocator)
-    .build()?;
+let channel_id = ChannelId::new("sync-stream")?;
+let tx = Builder::sender(channel_id.clone(), my_loc.clone(), peer_loc.clone()).build()?;
+let rx = Builder::receiver(channel_id, my_loc, peer_loc).build()?;
 
 tx.send(frame, &meta)?; // internally signals external semaphore
 let (frame, meta) = rx.recv::<ImageMeta>()?; // internally waits on external semaphore

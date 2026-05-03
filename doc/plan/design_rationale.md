@@ -27,10 +27,9 @@ This document explains the "why" behind all architectural decisions.
 
 ```rust
 // Same code works optimally on laptop, single-node, or cluster
-let sender = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone()).build()?;
-let receiver = ChannelBuilder::receiver(my_loc, peer_loc)
-    .with_allocator(cpu_allocator)
-    .build()?;
+let channel_id = ChannelId::new("image-stream")?;
+let sender = Builder::sender(channel_id.clone(), my_loc.clone(), peer_loc.clone()).build()?;
+let receiver = Builder::receiver(channel_id, my_loc, peer_loc).build()?;
 // Local → Vulkan IPC (< 100 ns)
 // Remote → MPI (~ 10 us)
 ```
@@ -147,10 +146,9 @@ let buffer = allocator.allocate(...)?;  // Clear ownership
 ```rust
 let mut send_allocator = lava_flow::gpu::Allocator::new_for_device(0)?;
 let send_buffer = send_allocator.allocate(size)?;
-let sender = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone()).build()?;
-let receiver = ChannelBuilder::receiver(my_loc, peer_loc)
-    .with_allocator(cpu_allocator)
-    .build()?;
+let channel_id = ChannelId::new("image-stream")?;
+let sender = Builder::sender(channel_id.clone(), my_loc.clone(), peer_loc.clone()).build()?;
+let receiver = Builder::receiver(channel_id, my_loc, peer_loc).build()?;
 // Channel decides receive materialization strategy based on transport + allocator config.
 ```
 

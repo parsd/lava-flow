@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::types::CommunicationScope;
+
 /// Shared validation reasons reused across public API errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ValidationReason {
@@ -152,6 +154,20 @@ pub enum LavaFlowError {
     /// Channel transport was disconnected before the operation completed.
     #[error("channel transport disconnected")]
     ChannelDisconnected,
+
+    /// Blocking channel endpoint construction was cancelled before it completed.
+    #[error("channel build cancelled for {endpoint} endpoint")]
+    ChannelBuildCancelled {
+        /// Endpoint kind whose build was cancelled.
+        endpoint: &'static str,
+    },
+
+    /// The requested communication scope is not implemented by the current channel runtime.
+    #[error("unsupported communication scope: {scope:?}")]
+    UnsupportedCommunicationScope {
+        /// Requested communication scope.
+        scope: CommunicationScope,
+    },
 
     /// Channel buffer kind is not supported by the selected transport.
     #[error("unsupported channel buffer kind: {kind}")]

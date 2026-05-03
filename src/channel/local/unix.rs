@@ -1,5 +1,5 @@
-use super::{FrameKind, channel_protocol_error, channel_transport_error};
-use crate::error::Result;
+use super::{Access, FrameKind, channel_protocol_error, channel_transport_error};
+use crate::error::{LavaFlowError, Result};
 use crate::memory::allocator::InterprocessMemoryHandle;
 use crate::types::ChannelId;
 use std::env;
@@ -20,23 +20,18 @@ const RUNTIME_DIR_OVERRIDE_ENV: &str = "LAVA_FLOW_RUNTIME_DIR";
 pub(crate) struct EndpointAddress(String);
 
 impl EndpointAddress {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn from_channel(channel_id: &ChannelId) -> Self {
-        let base = match runtime_dir_path() {
+    pub(crate) fn from_channel(channel_id: &ChannelId, access: Access) -> Self {
+        let base = match runtime_dir_path(access) {
             Some(path) => path,
             None => PathBuf::from("/run/user")
                 .join(unsafe { libc::geteuid() }.to_string())
                 .join("lava-flow"),
         };
-        let path = base.join(format!("{}.sock", channel_id.as_str()));
-        Self(path.to_string_lossy().into_owned())
-    }
-
-    #[cfg(test)]
-    pub(in crate::channel::local) fn from_test_channel(channel_id: &ChannelId) -> Self {
-        let path = env::temp_dir()
-            .join(format!("lava-flow-tests-{}", std::process::id()))
-            .join(format!("{}.sock", channel_id.as_str()));
+        let filename = match access {
+            Access::CurrentSession => format!("{}.sock", channel_id.as_str()),
+            Access::AuthenticatedUsers => format!("lava-flow-{}.sock", channel_id.as_str()),
+        };
+        let path = base.join(filename);
         Self(path.to_string_lossy().into_owned())
     }
 
@@ -147,9 +142,9 @@ pub(super) struct TransportListener {
 }
 
 impl TransportListener {
-    pub(super) fn bind(address: &EndpointAddress) -> Result<Self> {
+    pub(super) fn bind(address: &EndpointAddress, access: Access) -> Result<Self> {
         let path = PathBuf::from(address.as_str());
-        Self::ensure_endpoint_dir_exists(&path)?;
+        Self::ensure_endpoint_dir_exists(&path, access)?;
         if let Err(source) = fs::remove_file(&path)
             && source.kind() != std::io::ErrorKind::NotFound
         {
@@ -159,10 +154,17 @@ impl TransportListener {
             Ok(listener) => listener,
             Err(source) => return Err(channel_transport_error("bind", source)),
         };
+        if access == Access::AuthenticatedUsers {
+            // Socket node permissions are rw-rw-rw-; directory sticky-bit ownership protects
+            // unlink/replace while allowing authenticated local users to connect.
+            if let Err(source) = fs::set_permissions(&path, fs::Permissions::from_mode(0o666)) {
+                return Err(channel_transport_error("set_permissions", source));
+            }
+        }
         Ok(Self { listener, path })
     }
 
-    fn ensure_endpoint_dir_exists(path: &std::path::Path) -> Result<()> {
+    fn ensure_endpoint_dir_exists(path: &std::path::Path, access: Access) -> Result<()> {
         let Some(directory) = path.parent() else {
             return Err(channel_protocol_error(
                 "create_dir_all",
@@ -172,62 +174,86 @@ impl TransportListener {
         if let Err(source) = fs::create_dir_all(directory) {
             return Err(channel_transport_error("create_dir_all", source));
         }
-        // Validate ownership/type before changing permissions so we fail closed if some other
-        // user pre-created the directory or replaced it with a symlink.
-        Self::validate_runtime_dir(directory)?;
-        match fs::set_permissions(directory, fs::Permissions::from_mode(0o700)) {
-            Ok(()) => {}
-            Err(source) => return Err(channel_transport_error("set_permissions", source)),
+        match access {
+            Access::CurrentSession => {
+                // Validate ownership/type before changing permissions so we fail closed if some
+                // other user pre-created the directory or replaced it with a symlink.
+                Self::validate_runtime_dir(directory)?;
+                // Runtime directory permissions are rwx------. Directories need execute/search
+                // permission for the owner to traverse the path and create/remove the socket.
+                match fs::set_permissions(directory, fs::Permissions::from_mode(0o700)) {
+                    Ok(()) => {}
+                    Err(source) => return Err(channel_transport_error("set_permissions", source)),
+                }
+                // Re-check after chmod so the caller knows the final runtime directory is actually private.
+                Self::validate_private_runtime_dir(directory)
+            }
+            Access::AuthenticatedUsers => {
+                Self::validate_public_runtime_dir(directory, Access::AuthenticatedUsers)
+            }
         }
-        // Re-check after chmod so the caller knows the final runtime directory is actually private.
-        Self::validate_private_runtime_dir(directory)
     }
 
-    fn validate_runtime_dir(directory: &Path) -> Result<()> {
-        let metadata = fs::symlink_metadata(directory)
-            .map_err(|source| channel_transport_error("validate_runtime_dir", source))?;
+    fn runtime_dir_metadata(directory: &Path) -> Result<fs::Metadata> {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) => Ok(metadata),
+            Err(source) => Err(channel_transport_error("validate_runtime_dir", source)),
+        }
+    }
+
+    fn runtime_dir_permission_error(message: &'static str) -> LavaFlowError {
+        channel_transport_error(
+            "validate_runtime_dir",
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, message),
+        )
+    }
+
+    fn validate_runtime_dir(directory: &Path) -> Result<fs::Metadata> {
+        let metadata = Self::runtime_dir_metadata(directory)?;
         if metadata.file_type().is_symlink() {
-            return Err(channel_transport_error(
-                "validate_runtime_dir",
-                std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "runtime directory must not be a symlink",
-                ),
+            return Err(Self::runtime_dir_permission_error(
+                "runtime directory must not be a symlink",
             ));
         }
         if !metadata.is_dir() {
-            return Err(channel_transport_error(
-                "validate_runtime_dir",
-                std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "runtime directory must be a directory",
-                ),
+            return Err(Self::runtime_dir_permission_error(
+                "runtime directory must be a directory",
             ));
         }
         let euid = unsafe { libc::geteuid() };
         if std::os::unix::fs::MetadataExt::uid(&metadata) != euid {
-            return Err(channel_transport_error(
-                "validate_runtime_dir",
-                std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "runtime directory must be owned by the effective user",
-                ),
+            return Err(Self::runtime_dir_permission_error(
+                "runtime directory must be owned by the effective user",
+            ));
+        }
+        Ok(metadata)
+    }
+
+    fn validate_private_runtime_dir(directory: &Path) -> Result<()> {
+        let metadata = Self::validate_runtime_dir(directory)?;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Self::runtime_dir_permission_error(
+                "runtime directory permissions must not grant group or other access",
             ));
         }
         Ok(())
     }
 
-    fn validate_private_runtime_dir(directory: &Path) -> Result<()> {
-        Self::validate_runtime_dir(directory)?;
-        let metadata = fs::symlink_metadata(directory)
-            .map_err(|source| channel_transport_error("validate_runtime_dir", source))?;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(channel_transport_error(
-                "validate_runtime_dir",
-                std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "runtime directory permissions must not grant group or other access",
-                ),
+    fn validate_public_runtime_dir(directory: &Path, access: Access) -> Result<()> {
+        if access == Access::CurrentSession {
+            return Self::validate_private_runtime_dir(directory);
+        }
+
+        let metadata = Self::runtime_dir_metadata(directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(Self::runtime_dir_permission_error(
+                "public runtime path must be a non-symlink directory",
+            ));
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o002 == 0 || mode & 0o1000 == 0 {
+            return Err(Self::runtime_dir_permission_error(
+                "public runtime directory must be sticky and writable by other users",
             ));
         }
         Ok(())
@@ -239,6 +265,35 @@ impl TransportListener {
             Err(source) => return Err(channel_transport_error("accept", source)),
         };
         Ok(TransportSender { stream })
+    }
+
+    pub(super) fn try_accept(&mut self) -> Result<Option<TransportSender>> {
+        if let Err(source) = self.listener.set_nonblocking(true) {
+            return Err(channel_transport_error("set_nonblocking", source));
+        }
+        match self.listener.accept() {
+            Ok((stream, _)) => {
+                let listener_result = self.listener.set_nonblocking(false);
+                let stream_result = stream.set_nonblocking(false);
+                if let Err(source) = listener_result {
+                    return Err(channel_transport_error("set_nonblocking", source));
+                }
+                if let Err(source) = stream_result {
+                    return Err(channel_transport_error("set_nonblocking", source));
+                }
+                Ok(Some(TransportSender { stream }))
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Err(source) = self.listener.set_nonblocking(false) {
+                    return Err(channel_transport_error("set_nonblocking", source));
+                }
+                Ok(None)
+            }
+            Err(source) => {
+                let _ = self.listener.set_nonblocking(false);
+                Err(channel_transport_error("accept", source))
+            }
+        }
     }
 }
 
@@ -333,7 +388,11 @@ impl TransportReceiver {
     }
 }
 
-fn runtime_dir_path() -> Option<PathBuf> {
+fn runtime_dir_path(access: Access) -> Option<PathBuf> {
+    if access == Access::AuthenticatedUsers {
+        return Some(env::temp_dir());
+    }
+
     let uid = unsafe { libc::geteuid() };
     runtime_dir_path_with(
         env::var_os(RUNTIME_DIR_OVERRIDE_ENV),
@@ -408,7 +467,14 @@ fn home_dir_from_passwd(uid: libc::uid_t) -> Option<PathBuf> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn is_retryable_connect_error(operation: &'static str, source: &std::io::Error) -> bool {
+    operation == "connect"
+        && matches!(
+            source.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        )
+}
+
 trait Syscalls: Sync {
     fn sendmsg(
         &self,
@@ -473,13 +539,30 @@ impl Syscalls for RealSyscalls {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) struct TestRuntimeDirGuard {
+    _guard: crate::test_support::env::Guard,
+}
+
+#[cfg(test)]
+pub(crate) fn stable_test_runtime_dir_guard(test_name: &str, id: u64) -> TestRuntimeDirGuard {
+    let runtime_dir = env::temp_dir()
+        .join(format!("lava-flow-public-channel-{test_name}-{id}"))
+        .to_string_lossy()
+        .into_owned();
+    TestRuntimeDirGuard {
+        _guard: crate::test_support::env::Guard::set(RUNTIME_DIR_OVERRIDE_ENV, &runtime_dir),
+    }
+}
+
+#[cfg(test)]
+pub(in crate::channel::local) mod tests {
     use super::super::tests::support::{
         BUFFER_SIZE, TestMeta, USED_SIZE, test_allocator, test_pair, test_transport_pair,
     };
-    use super::super::{LocalProtocolLimits, ProtocolTag, Receiver};
+    use super::super::{ProtocolLimits, ProtocolTag, Receiver};
     use super::*;
     use crate::test_support::env::Guard as EnvGuard;
+    use crate::test_support::fs::{TempDir, TempFile};
     use crate::{channel::MetadataEncoding, error::LavaFlowError};
     use std::collections::BTreeMap;
     use std::os::fd::FromRawFd;
@@ -508,6 +591,17 @@ mod tests {
                     false
                 }
             })
+        }
+
+        pub(in crate::channel::local) fn test_address() -> EndpointAddress {
+            static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let channel_id = ChannelId::new(format!("unix-channel-{id}")).expect("channel id");
+            let path = env::temp_dir()
+                .join(format!("lava-flow-tests-{}", std::process::id()))
+                .join(format!("{}.sock", channel_id.as_str()));
+            EndpointAddress(path.to_string_lossy().into_owned())
         }
 
         pub(in crate::channel::local) struct MockSyscalls;
@@ -562,6 +656,8 @@ mod tests {
         }
     }
 
+    use support::test_address;
+
     fn pipe_write_end() -> OwnedFd {
         let mut fds = [0; 2];
         let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
@@ -570,6 +666,19 @@ mod tests {
         let write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
         drop(read_end);
         write_end
+    }
+
+    #[test]
+    fn retry_classifier_accepts_only_startup_race_connect_errors() {
+        let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "listener not ready");
+        let refused =
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "listener not ready");
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+
+        assert!(is_retryable_connect_error("connect", &not_found));
+        assert!(is_retryable_connect_error("connect", &refused));
+        assert!(!is_retryable_connect_error("connect", &denied));
+        assert!(!is_retryable_connect_error("CreateFileW", &not_found));
     }
 
     #[test]
@@ -622,22 +731,23 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!("lava-flow-unix-bind-test-{id}"));
-        let _cleanup_before = fs::remove_dir_all(&base);
-        let base_string = base.to_string_lossy().into_owned();
+        let base =
+            TempDir::create(std::env::temp_dir().join(format!("lava-flow-unix-bind-test-{id}")))
+                .expect("create test base directory");
+        let base_string = base.path().to_string_lossy().into_owned();
         let _guard = EnvGuard::set("XDG_RUNTIME_DIR", &base_string);
 
-        let socket_path = runtime_dir_path()
+        let socket_path = runtime_dir_path(Access::CurrentSession)
             .expect("resolve runtime dir")
             .join("permissions-probe.sock");
-        TransportListener::ensure_endpoint_dir_exists(&socket_path)
+        TransportListener::ensure_endpoint_dir_exists(&socket_path, Access::CurrentSession)
             .expect("create runtime directory");
 
         let channel_id = ChannelId::new("bind-remove-file-error").expect("channel id");
-        let address = EndpointAddress::from_channel(&channel_id);
+        let address = EndpointAddress::from_channel(&channel_id, Access::CurrentSession);
         fs::create_dir_all(address.as_str()).expect("create blocking directory at socket path");
 
-        let err = TransportListener::bind(&address)
+        let err = TransportListener::bind(&address, Access::CurrentSession)
             .expect_err("bind must fail when existing socket path is a directory");
         assert!(matches!(
             err,
@@ -646,14 +756,12 @@ mod tests {
                 ..
             }
         ));
-
-        let _cleanup_after = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn endpoint_address_uses_private_runtime_directory() {
         let channel_id = ChannelId::new("channel-0").expect("channel id");
-        let address = EndpointAddress::from_channel(&channel_id);
+        let address = EndpointAddress::from_channel(&channel_id, Access::CurrentSession);
 
         assert!(
             address.as_str().contains("lava-flow"),
@@ -665,6 +773,15 @@ mod tests {
             "expected unix endpoint to end with socket filename, got {}",
             address.as_str()
         );
+    }
+
+    #[test]
+    fn authenticated_users_endpoint_uses_system_temp_directory() {
+        let channel_id = ChannelId::new("auth-users-channel").expect("channel id");
+        let address = EndpointAddress::from_channel(&channel_id, Access::AuthenticatedUsers);
+        let expected = std::env::temp_dir().join("lava-flow-auth-users-channel.sock");
+
+        assert_eq!(PathBuf::from(address.as_str()), expected);
     }
 
     #[test]
@@ -714,18 +831,19 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!("lava-flow-unix-runtime-test-{id}"));
-        let _cleanup_before = fs::remove_dir_all(&base);
-        let base_string = base.to_string_lossy().into_owned();
+        let base =
+            TempDir::create(std::env::temp_dir().join(format!("lava-flow-unix-runtime-test-{id}")))
+                .expect("create test base directory");
+        let base_string = base.path().to_string_lossy().into_owned();
         let _guard = EnvGuard::set("XDG_RUNTIME_DIR", &base_string);
 
-        let socket_path = runtime_dir_path()
+        let socket_path = runtime_dir_path(Access::CurrentSession)
             .expect("resolve runtime dir")
             .join("permissions-probe.sock");
-        TransportListener::ensure_endpoint_dir_exists(&socket_path)
+        TransportListener::ensure_endpoint_dir_exists(&socket_path, Access::CurrentSession)
             .expect("create runtime directory");
 
-        let runtime_dir = runtime_dir_path().expect("resolve runtime dir");
+        let runtime_dir = runtime_dir_path(Access::CurrentSession).expect("resolve runtime dir");
         let metadata = fs::metadata(&runtime_dir).expect("read runtime directory metadata");
         let mode = metadata.permissions().mode() & 0o777;
 
@@ -734,8 +852,20 @@ mod tests {
             "expected private runtime directory permissions, got {:o}",
             mode,
         );
+    }
 
-        let _cleanup_after = fs::remove_dir_all(&base);
+    #[test]
+    fn authenticated_users_bind_sets_socket_permissions_for_local_users() {
+        let channel_id = ChannelId::new(format!("auth-users-socket-{}", std::process::id()))
+            .expect("channel id");
+        let address = EndpointAddress::from_channel(&channel_id, Access::AuthenticatedUsers);
+        let listener = TransportListener::bind(&address, Access::AuthenticatedUsers)
+            .expect("bind authenticated-users listener");
+
+        let metadata = fs::metadata(address.as_str()).expect("read socket metadata");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o666);
+
+        drop(listener);
     }
 
     #[test]
@@ -743,16 +873,164 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let directory = std::env::temp_dir().join(format!("lava-flow-validate-runtime-{id}"));
-        let _cleanup_before = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).expect("create runtime directory");
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        let directory =
+            TempDir::create(std::env::temp_dir().join(format!("lava-flow-validate-runtime-{id}")))
+                .expect("create runtime directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
             .expect("set private permissions");
 
-        TransportListener::validate_private_runtime_dir(&directory)
+        TransportListener::validate_private_runtime_dir(directory.path())
             .expect("owned private directory must be accepted");
+    }
 
-        let _cleanup_after = fs::remove_dir_all(&directory);
+    #[test]
+    fn validate_runtime_dir_rejects_regular_file() {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("lava-flow-runtime-file-{id}"));
+        let file = TempFile::with_contents(path, b"not a directory").expect("create runtime file");
+
+        let err = TransportListener::validate_runtime_dir(file.path())
+            .expect_err("regular file must not be accepted as runtime dir");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "validate_runtime_dir",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_private_runtime_dir_rejects_group_or_other_permissions() {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            TempDir::create(std::env::temp_dir().join(format!("lava-flow-public-runtime-{id}")))
+                .expect("create runtime directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755))
+            .expect("set public permissions");
+
+        let err = TransportListener::validate_private_runtime_dir(directory.path())
+            .expect_err("public runtime directory permissions must be rejected");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "validate_runtime_dir",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_public_runtime_dir_rejects_regular_file() {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("lava-flow-public-runtime-file-{id}"));
+        let file =
+            TempFile::with_contents(path, b"not a directory").expect("create public runtime file");
+
+        let err =
+            TransportListener::validate_public_runtime_dir(file.path(), Access::AuthenticatedUsers)
+                .expect_err("regular file must not be accepted as public runtime dir");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "validate_runtime_dir",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_public_runtime_dir_rejects_non_sticky_directory() {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory = TempDir::create(
+            std::env::temp_dir().join(format!("lava-flow-public-runtime-private-{id}")),
+        )
+        .expect("create public runtime directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("set private permissions");
+
+        let err = TransportListener::validate_public_runtime_dir(
+            directory.path(),
+            Access::AuthenticatedUsers,
+        )
+        .expect_err("non-sticky private dir must not be accepted as public runtime dir");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "validate_runtime_dir",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ensure_endpoint_dir_exists_reports_create_dir_all_failure() {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("lava-flow-runtime-parent-file-{id}"));
+        let file =
+            TempFile::with_contents(path, b"not a directory").expect("create blocking parent file");
+        let socket_path = file.path().join("blocked.sock");
+
+        let err =
+            TransportListener::ensure_endpoint_dir_exists(&socket_path, Access::AuthenticatedUsers)
+                .expect_err("file parent must make create_dir_all fail");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "create_dir_all",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bind_reports_os_bind_failure_for_too_long_socket_path() {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base =
+            TempDir::create(std::env::temp_dir().join(format!("lava-flow-long-socket-{id}")))
+                .expect("create long socket base");
+        let path = base.path().join(format!("{}.sock", "a".repeat(200)));
+        let address = EndpointAddress(path.to_string_lossy().into_owned());
+
+        let err = TransportListener::bind(&address, Access::CurrentSession)
+            .expect_err("overlong socket path must fail at bind");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "bind",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn home_dir_for_uid_prefers_home_env() {
+        let uid = unsafe { libc::geteuid() };
+        let home = std::env::temp_dir().join("lava-flow-home-env");
+        let home_string = home.to_string_lossy().into_owned();
+        let _guard = EnvGuard::set("HOME", &home_string);
+
+        assert_eq!(home_dir_for_uid(uid), Some(home));
+    }
+
+    #[test]
+    fn home_dir_for_uid_falls_back_to_passwd_when_home_is_unset() {
+        let uid = unsafe { libc::geteuid() };
+        let _guard = EnvGuard::unset("HOME");
+
+        assert_eq!(home_dir_for_uid(uid), home_dir_from_passwd(uid));
     }
 
     #[test]
@@ -771,19 +1049,20 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!("lava-flow-unix-symlink-test-{id}"));
-        let target = base.join("target");
-        let runtime_link = base.join("runtime-link");
-        let _cleanup_before = fs::remove_dir_all(&base);
+        let base =
+            TempDir::create(std::env::temp_dir().join(format!("lava-flow-unix-symlink-test-{id}")))
+                .expect("create test base directory");
+        let target = base.path().join("target");
+        let runtime_link = base.path().join("runtime-link");
         fs::create_dir_all(&target).expect("create target directory");
         std::os::unix::fs::symlink(&target, &runtime_link).expect("create runtime symlink");
         let runtime_string = runtime_link.to_string_lossy().into_owned();
         let _guard = EnvGuard::set(RUNTIME_DIR_OVERRIDE_ENV, &runtime_string);
 
         let channel_id = ChannelId::new("symlink-runtime-dir").expect("channel id");
-        let address = EndpointAddress::from_channel(&channel_id);
+        let address = EndpointAddress::from_channel(&channel_id, Access::CurrentSession);
 
-        let err = TransportListener::bind(&address)
+        let err = TransportListener::bind(&address, Access::CurrentSession)
             .expect_err("bind must reject symlinked runtime directory");
         assert!(matches!(
             err,
@@ -792,14 +1071,15 @@ mod tests {
                 ..
             }
         ));
-
-        let _cleanup_after = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn ensure_endpoint_dir_exists_rejects_path_without_parent_directory() {
-        let err = TransportListener::ensure_endpoint_dir_exists(std::path::Path::new("/"))
-            .expect_err("root path must be rejected because it has no parent endpoint directory");
+        let err = TransportListener::ensure_endpoint_dir_exists(
+            std::path::Path::new("/"),
+            Access::CurrentSession,
+        )
+        .expect_err("root path must be rejected because it has no parent endpoint directory");
         assert!(matches!(
             err,
             LavaFlowError::ChannelTransportOperation {
@@ -811,8 +1091,9 @@ mod tests {
 
     #[test]
     fn transport_pair_supports_reverse_control_bytes_directly() {
-        let address = super::super::tests::support::test_address();
-        let listener = TransportListener::bind(&address).expect("bind transport listener");
+        let address = test_address();
+        let listener = TransportListener::bind(&address, Access::CurrentSession)
+            .expect("bind transport listener");
         let receiver_address = address.clone();
         let receiver_thread = thread::spawn(move || {
             let mut receiver =
@@ -843,6 +1124,119 @@ mod tests {
             .join()
             .expect("receiver thread must not panic");
         assert_eq!(reply, 0xCD);
+    }
+
+    #[test]
+    fn try_accept_returns_none_without_connected_receiver() {
+        let address = test_address();
+        let mut listener = TransportListener::bind(&address, Access::CurrentSession)
+            .expect("bind transport listener");
+
+        assert!(
+            listener
+                .try_accept()
+                .expect("try_accept without receiver should not fail")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn try_accept_restores_blocking_mode_after_empty_poll() {
+        let address = test_address();
+        let mut listener = TransportListener::bind(&address, Access::CurrentSession)
+            .expect("bind transport listener");
+
+        assert!(
+            listener
+                .try_accept()
+                .expect("empty try_accept should not fail")
+                .is_none()
+        );
+
+        let receiver_address = address.clone();
+        let accept_thread = thread::spawn(move || {
+            let mut sender = listener.accept().expect("blocking accept should wait");
+            sender
+                .write_all(&[0xFA])
+                .expect("write accepted sender byte");
+            sender.flush().expect("flush accepted sender byte");
+        });
+        thread::sleep(std::time::Duration::from_millis(50));
+
+        let mut receiver =
+            TransportReceiver::connect(&receiver_address).expect("connect transport receiver");
+        let mut byte = [0_u8; 1];
+        receiver
+            .read_exact(&mut byte)
+            .expect("read accepted sender byte");
+
+        accept_thread.join().expect("accept thread must not panic");
+        assert_eq!(byte[0], 0xFA);
+    }
+
+    #[test]
+    fn try_accept_accepts_connected_receiver() {
+        let address = test_address();
+        let mut listener = TransportListener::bind(&address, Access::CurrentSession)
+            .expect("bind transport listener");
+        let receiver_address = address.clone();
+        let receiver_thread = thread::spawn(move || {
+            let mut receiver =
+                TransportReceiver::connect(&receiver_address).expect("connect transport receiver");
+            let mut byte = [0_u8; 1];
+            receiver
+                .read_exact(&mut byte)
+                .expect("read accepted sender byte");
+            byte[0]
+        });
+
+        let mut sender = loop {
+            if let Some(sender) = listener.try_accept().expect("poll listener") {
+                break sender;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        };
+        sender.write_all(&[0xEF]).expect("write sender byte");
+        sender.flush().expect("flush sender byte");
+
+        assert_eq!(
+            receiver_thread
+                .join()
+                .expect("receiver thread must not panic"),
+            0xEF
+        );
+    }
+
+    #[test]
+    fn transport_sender_reports_read_error_after_receiver_drop() {
+        let (mut sender, receiver) =
+            super::super::tests::support::test_transport_pair().expect("create transport pair");
+        drop(receiver);
+
+        let mut byte = [0_u8; 1];
+        let err = sender
+            .read_exact(&mut byte)
+            .expect_err("read from closed receiver socket must fail");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation { .. } | LavaFlowError::ChannelDisconnected
+        ));
+    }
+
+    #[test]
+    fn transport_receiver_reports_write_error_after_sender_drop() {
+        let (sender, mut receiver) =
+            super::super::tests::support::test_transport_pair().expect("create transport pair");
+        drop(sender);
+
+        let err = receiver
+            .write_all(&[0xAA])
+            .and_then(|()| receiver.flush())
+            .expect_err("write or flush to closed sender socket must fail");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation { .. } | LavaFlowError::ChannelDisconnected
+        ));
     }
 
     #[test]
@@ -958,7 +1352,7 @@ mod tests {
         let mut receiver = Receiver::new(
             MetadataEncoding::Json,
             receiver_transport,
-            LocalProtocolLimits::default(),
+            ProtocolLimits::default(),
         );
         let metadata = serde_json::to_vec(&TestMeta {
             used_size: USED_SIZE,
@@ -1001,7 +1395,7 @@ mod tests {
         let mut receiver = Receiver::new(
             MetadataEncoding::Json,
             receiver_transport,
-            LocalProtocolLimits::default(),
+            ProtocolLimits::default(),
         );
         let metadata = serde_json::to_vec(&crate::channel::MessageMeta {
             used_size: USED_SIZE,

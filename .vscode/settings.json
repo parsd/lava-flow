@@ -10,5 +10,11 @@
     ],
     "editor.rulers": [
         120
-    ]
+    ],
+    "chat.tools.terminal.autoApprove": {
+        "cargo check": true,
+        "cargo test": true,
+        "cargo clean": true,
+        "cargo clippy": true
+    }
 }

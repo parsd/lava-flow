@@ -30,12 +30,19 @@ targets point-to-point local channels first.
 Implemented now:
 
 - internal local bootstrap with deterministic endpoint naming from `ChannelId`
+- public `Builder::sender(channel_id, my_location, peer_location)` /
+  `Builder::receiver(channel_id, my_location, peer_location)` for local scope
+- convenience `Builder::local_sender(channel_id)` / `Builder::local_receiver(channel_id)` using
+  hostname detection for the common same-host case
 - `Sender` / `Receiver` local runtime for point-to-point CPU shared-memory transport
 - versioned tagged local control protocol
 - explicit receiver import `ImportOk` / `ImportFailed` ACK/NACK
 - configurable local protocol size limits:
   - payload cap
   - metadata cap
+- receiver-side `build_with_timeout(...)` for startup-tolerant local connect
+- sender-side `build_with_timeout(...)` for bounded local accept
+- `BuildCancel` support for cancelling blocking sender and receiver construction
 - Windows local access control:
   - duplex named pipe
   - explicit current-logon-session DACL
@@ -49,7 +56,8 @@ Implemented now:
 
 Not implemented yet:
 
-- public `ChannelBuilder::sender(...)` / `ChannelBuilder::receiver(...)`
+- remote builder/runtime path
+- receiver-side materialization allocator integration
 - GPU local handle transfer and Vulkan IPC transport wiring
 - true inter-process CPU and GPU test coverage
 - bootstrap authentication and optional peer-identity validation
@@ -81,7 +89,7 @@ Rationale:
 
 ## Deliverables
 
-- `ChannelBuilder::sender(...)` and `ChannelBuilder::receiver(...)` returning distinct builders
+- `Builder::sender(...)` and `Builder::receiver(...)` returning distinct builders
 - `Sender` / `Receiver` endpoint types
 - `ChannelAllocator` trait with fixed-target allocation-only implementations
 - No `src/memory/unified.rs` planning; allocator composition stays in traits/builders and existing module boundaries
@@ -149,6 +157,7 @@ introduced:
 - Windows:
   - duplex named pipe is created with an explicit DACL
   - default policy is current logon session only
+  - opt-in authenticated-users policy uses the Windows Authenticated Users SID, not Everyone
   - the same pipe carries bootstrap, envelopes, and import ACK/NACK traffic
 - Unix:
   - local sockets are created under a private per-user runtime directory
@@ -158,11 +167,14 @@ introduced:
   - final fallback is `$HOME/.local/run/lava-flow/`
   - the selected runtime directory is required to be non-symlinked, owned by the effective user,
     and forced to `0700`
+  - opt-in authenticated-users policy uses a socket directly under the system temporary directory,
+    with socket mode `0666` and a sticky world-writable parent directory requirement
 - Local protocol limits:
   - default payload cap is `1 GiB`
   - default metadata cap is `1 MiB`
   - the local sender/listener and receiver are constructed with explicit limits
-  - later builder defaults should provide those values at the public API boundary
+  - public builders expose separate local maximum payload and metadata size setters so callers do
+    not have to pass two same-typed limit values in one call
 
 This is the currently implemented baseline. It reduces cross-user access and bounds envelope
 resource use, but it does not yet authenticate that the connected peer is the intended process.
@@ -258,13 +270,15 @@ API rather than by exposing all transport internals by default.
 ## Example (API Shape)
 
 ```rust
-let tx = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone())
-    .with_metadata_encoding(MetadataEncoding::Cbor)
+let channel_id = ChannelId::new("image-stream")?;
+
+// Sender process. For local scope, build waits until the receiver peer connects.
+let tx = Builder::sender(channel_id.clone(), my_loc.clone(), peer_loc.clone())
+    .with_metadata_encoding(MetadataEncoding::Json)
     .build()?;
 
-let rx = ChannelBuilder::receiver(my_loc, peer_loc)
-    .with_allocator(cpu_allocator)
-    .build()?;
+// Receiver process.
+let rx = Builder::receiver(channel_id, my_loc, peer_loc).build()?;
 
 let meta = ImageMeta {
     used_size: payload_bytes,

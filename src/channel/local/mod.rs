@@ -1,8 +1,11 @@
-use super::{Frame, MessageMeta, Metadata, MetadataEncoding};
+use super::{BuildCancel, Frame, MessageMeta, Metadata, MetadataEncoding};
 use crate::error::{LavaFlowError, Result};
 use crate::memory::allocator::InterprocessMemoryHandle;
 use crate::memory::cpu;
+use crate::types::ChannelId;
 use std::convert::TryFrom;
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 mod unix;
@@ -19,13 +22,23 @@ const LOCAL_PROTOCOL_VERSION: u8 = 1;
 const DEFAULT_MAX_LOCAL_CHANNEL_PAYLOAD_SIZE: usize = 1024 * 1024 * 1024;
 const DEFAULT_MAX_LOCAL_CHANNEL_METADATA_SIZE: usize = 1024 * 1024;
 
+/// Local IPC peer access policy selected by public builder convenience methods.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Access {
+    /// Restrict local IPC to the current Windows logon session or Unix user.
+    #[default]
+    CurrentSession,
+    /// Allow authenticated local OS users to connect to the local IPC endpoint.
+    AuthenticatedUsers,
+}
+
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct LocalProtocolLimits {
+pub(crate) struct ProtocolLimits {
     max_payload_size: usize,
     max_metadata_size: usize,
 }
 
-impl LocalProtocolLimits {
+impl ProtocolLimits {
     /// Creates limits with explicit caps.
     ///
     /// A value of `0` for either cap means "use the built-in default" for that dimension.
@@ -42,16 +55,6 @@ impl LocalProtocolLimits {
                 max_metadata_size
             },
         }
-    }
-
-    /// Returns the effective maximum accepted payload size in bytes.
-    pub(crate) fn max_payload_size(&self) -> usize {
-        self.max_payload_size
-    }
-
-    /// Returns the effective maximum accepted metadata size in bytes.
-    pub(crate) fn max_metadata_size(&self) -> usize {
-        self.max_metadata_size
     }
 
     fn validate_outbound_payload_size(&self, payload_size: usize) -> Result<()> {
@@ -95,7 +98,7 @@ impl LocalProtocolLimits {
     }
 }
 
-impl Default for LocalProtocolLimits {
+impl Default for ProtocolLimits {
     fn default() -> Self {
         Self {
             max_payload_size: DEFAULT_MAX_LOCAL_CHANNEL_PAYLOAD_SIZE,
@@ -221,18 +224,17 @@ impl TryFrom<u8> for FrameKind {
 /// This transport uses an OS-native local IPC primitive to transfer the control envelope while the
 /// payload bytes stay in shared memory and are referenced through an exported CPU handle.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Sender {
     encoding: MetadataEncoding,
     transport: platform::TransportSender,
-    limits: LocalProtocolLimits,
+    limits: ProtocolLimits,
 }
 
 impl Sender {
     fn new(
         encoding: MetadataEncoding,
         transport: platform::TransportSender,
-        limits: LocalProtocolLimits,
+        limits: ProtocolLimits,
     ) -> Self {
         Self {
             encoding,
@@ -241,21 +243,20 @@ impl Sender {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn listen(
         encoding: MetadataEncoding,
         address: &EndpointAddress,
-        limits: LocalProtocolLimits,
+        limits: ProtocolLimits,
+        access: Access,
     ) -> Result<SenderListener> {
         Ok(SenderListener {
             encoding,
-            listener: platform::TransportListener::bind(address)?,
+            listener: platform::TransportListener::bind(address, access)?,
             limits,
         })
     }
 
     /// Sends a payload frame with typed metadata through local CPU IPC.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn send<F, M>(&mut self, frame: F, metadata: &M) -> Result<()>
     where
         F: Into<Frame>,
@@ -283,7 +284,6 @@ impl Sender {
     }
 
     /// Sends a payload frame with dynamic metadata through local CPU IPC.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn send_map<F>(&mut self, frame: F, metadata: MessageMeta) -> Result<()>
     where
         F: Into<Frame>,
@@ -324,29 +324,67 @@ impl Sender {
     }
 }
 
+pub(crate) fn listen(
+    channel_id: &ChannelId,
+    encoding: MetadataEncoding,
+    limits: ProtocolLimits,
+    access: Access,
+) -> Result<SenderListener> {
+    let address = EndpointAddress::from_channel(channel_id, access);
+    Sender::listen(encoding, &address, limits, access)
+}
+
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SenderListener {
     encoding: MetadataEncoding,
     listener: platform::TransportListener,
-    limits: LocalProtocolLimits,
+    limits: ProtocolLimits,
 }
 
 impl SenderListener {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn accept(self) -> Result<Sender> {
         let mut transport = self.listener.accept()?;
         ConnectionHeader::from_encoding(self.encoding).write_to(&mut transport)?;
         Ok(Sender::new(self.encoding, transport, self.limits))
     }
+
+    pub(crate) fn accept_with_control(
+        mut self,
+        timeout: Option<Duration>,
+        cancel: Option<&BuildCancel>,
+        poll_delay: Duration,
+        endpoint: &'static str,
+    ) -> Result<Sender> {
+        let start = Instant::now();
+
+        loop {
+            if cancel.is_some_and(BuildCancel::is_cancelled) {
+                return Err(LavaFlowError::ChannelBuildCancelled { endpoint });
+            }
+
+            match self.listener.try_accept()? {
+                Some(mut transport) => {
+                    ConnectionHeader::from_encoding(self.encoding).write_to(&mut transport)?;
+                    return Ok(Sender::new(self.encoding, transport, self.limits));
+                }
+                None => {
+                    if let Some(timeout) = timeout
+                        && start.elapsed() >= timeout
+                    {
+                        return Err(sender_accept_timeout_error(timeout));
+                    }
+                    thread::sleep(poll_delay);
+                }
+            }
+        }
+    }
 }
 
 /// Receiver half of the local CPU IPC transport.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Receiver {
     encoding: MetadataEncoding,
-    limits: LocalProtocolLimits,
+    limits: ProtocolLimits,
     transport: platform::TransportReceiver,
 }
 
@@ -354,7 +392,7 @@ impl Receiver {
     fn new(
         encoding: MetadataEncoding,
         transport: platform::TransportReceiver,
-        limits: LocalProtocolLimits,
+        limits: ProtocolLimits,
     ) -> Self {
         Self {
             encoding,
@@ -363,15 +401,13 @@ impl Receiver {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn connect(address: &EndpointAddress, limits: LocalProtocolLimits) -> Result<Self> {
+    pub(crate) fn connect(address: &EndpointAddress, limits: ProtocolLimits) -> Result<Self> {
         let mut transport = platform::TransportReceiver::connect(address)?;
         let header = ConnectionHeader::read_from(&mut transport)?;
         Ok(Self::new(header.encoding, transport, limits))
     }
 
     /// Receives a payload frame with typed metadata through local CPU IPC.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn recv<M: Metadata>(&mut self) -> Result<(Frame, M)> {
         let message = MessageEnvelope::read_from(&mut self.transport, self.limits)?;
         let frame = match message.try_into_frame() {
@@ -389,7 +425,6 @@ impl Receiver {
     }
 
     /// Receives a payload frame with dynamic metadata through local CPU IPC.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn recv_map(&mut self) -> Result<(Frame, MessageMeta)> {
         let message = MessageEnvelope::read_from(&mut self.transport, self.limits)?;
         let frame = match message.try_into_frame() {
@@ -412,6 +447,24 @@ impl Receiver {
     }
 }
 
+pub(crate) fn connect(
+    channel_id: &ChannelId,
+    limits: ProtocolLimits,
+    access: Access,
+) -> Result<Receiver> {
+    let address = EndpointAddress::from_channel(channel_id, access);
+    Receiver::connect(&address, limits)
+}
+
+pub(crate) fn is_retryable_connect_error(err: &LavaFlowError) -> bool {
+    match err {
+        LavaFlowError::ChannelTransportOperation { operation, source } => {
+            platform::is_retryable_connect_error(operation, source)
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug)]
 struct MessageEnvelope {
     size: usize,
@@ -424,7 +477,7 @@ impl MessageEnvelope {
         frame: Frame,
         encoding: MetadataEncoding,
         metadata: &M,
-        limits: LocalProtocolLimits,
+        limits: ProtocolLimits,
     ) -> Result<Self> {
         let metadata = Self::encode_metadata(encoding, metadata)?;
         let (size, handle) = Self::export_frame(frame)?;
@@ -463,7 +516,7 @@ impl MessageEnvelope {
 
     fn read_from(
         transport: &mut platform::TransportReceiver,
-        limits: LocalProtocolLimits,
+        limits: ProtocolLimits,
     ) -> Result<Self> {
         let tag = ProtocolTag::read_from_receiver(transport, "read_message_envelope")?;
         if tag != ProtocolTag::MessageEnvelope {
@@ -525,7 +578,7 @@ impl MessageEnvelope {
 
     fn try_into_frame(&self) -> Result<Frame> {
         // TODO: import GPU-backed frames here once the local transport grows recv_gpu_handle()
-        // support and the Vulkan IPC path is wired into channel::local.
+        // support and the Vulkan IPC path is wired into channels::local.
         match FrameKind::from_handle(&self.handle) {
             FrameKind::Cpu => {
                 let buffer =
@@ -552,7 +605,7 @@ impl MessageEnvelope {
 
     fn export_frame(frame: Frame) -> Result<(usize, InterprocessMemoryHandle)> {
         // TODO: export GPU-backed frames here once the generic local transport grows a
-        // send_gpu_handle() path. For now channel::local remains CPU-only at the handle-transfer
+        // send_gpu_handle() path. For now channels::local remains CPU-only at the handle-transfer
         // layer even though the protocol already reserves a GPU frame-kind tag.
         match frame {
             Frame::Cpu(buffer) => Ok((buffer.size(), buffer.shared_handle()?)),
@@ -579,14 +632,30 @@ fn channel_protocol_error(operation: &'static str, message: &'static str) -> Lav
     }
 }
 
+fn sender_accept_timeout_error(timeout: Duration) -> LavaFlowError {
+    LavaFlowError::ChannelTransportOperation {
+        operation: "accept",
+        source: std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("sender accept timed out after {timeout:?}"),
+        ),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn stable_test_runtime_dir_guard(
+    test_name: &str,
+    id: u64,
+) -> platform::TestRuntimeDirGuard {
+    platform::stable_test_runtime_dir_guard(test_name, id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::channel::MetaValue;
-    use crate::types::ChannelId;
     use serde::{Deserialize, Serialize, Serializer};
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
 
     pub(in crate::channel::local) mod support {
@@ -629,21 +698,22 @@ mod tests {
         pub(in crate::channel::local) const TEST_BYTE_VALUE: u8 = 0x5a;
 
         pub(in crate::channel::local) fn test_address() -> EndpointAddress {
-            static COUNTER: AtomicU64 = AtomicU64::new(1);
-
-            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let channel_id = ChannelId::new(format!("channel-{id}")).expect("channel id");
-            EndpointAddress::from_test_channel(&channel_id)
+            platform::tests::support::test_address()
         }
 
         pub(in crate::channel::local) fn test_pair(
             encoding: MetadataEncoding,
         ) -> Result<(Sender, Receiver)> {
             let address = test_address();
-            let listener = Sender::listen(encoding, &address, LocalProtocolLimits::default())?;
+            let listener = Sender::listen(
+                encoding,
+                &address,
+                ProtocolLimits::default(),
+                Access::CurrentSession,
+            )?;
             let receiver_address = address.clone();
             let receiver_thread = thread::spawn(move || {
-                Receiver::connect(&receiver_address, LocalProtocolLimits::default())
+                Receiver::connect(&receiver_address, ProtocolLimits::default())
             });
             let sender = listener.accept()?;
             let receiver = receiver_thread
@@ -655,7 +725,7 @@ mod tests {
         pub(in crate::channel::local) fn test_transport_pair()
         -> Result<(platform::TransportSender, platform::TransportReceiver)> {
             let address = test_address();
-            let listener = platform::TransportListener::bind(&address)?;
+            let listener = platform::TransportListener::bind(&address, Access::CurrentSession)?;
             let receiver_address = address.clone();
             let receiver_thread =
                 thread::spawn(move || platform::TransportReceiver::connect(&receiver_address));
@@ -849,8 +919,8 @@ mod tests {
         let first = ChannelId::new("channel-0").expect("first channel id");
         let second = ChannelId::new("channel-1").expect("second channel id");
 
-        let forward = EndpointAddress::from_channel(&first);
-        let reverse = EndpointAddress::from_channel(&second);
+        let forward = EndpointAddress::from_channel(&first, Access::CurrentSession);
+        let reverse = EndpointAddress::from_channel(&second, Access::CurrentSession);
 
         assert_ne!(forward, reverse);
     }
@@ -873,26 +943,26 @@ mod tests {
 
     #[test]
     fn local_protocol_limits_default_to_expected_caps() {
-        let limits = LocalProtocolLimits::default();
+        let limits = ProtocolLimits::default();
         assert_eq!(
-            limits.max_payload_size(),
+            limits.max_payload_size,
             DEFAULT_MAX_LOCAL_CHANNEL_PAYLOAD_SIZE
         );
         assert_eq!(
-            limits.max_metadata_size(),
+            limits.max_metadata_size,
             DEFAULT_MAX_LOCAL_CHANNEL_METADATA_SIZE
         );
     }
 
     #[test]
     fn local_protocol_limits_zero_caps_fall_back_to_defaults() {
-        let limits = LocalProtocolLimits::with_max_sizes(0, 0);
+        let limits = ProtocolLimits::with_max_sizes(0, 0);
         assert_eq!(
-            limits.max_payload_size(),
+            limits.max_payload_size,
             DEFAULT_MAX_LOCAL_CHANNEL_PAYLOAD_SIZE
         );
         assert_eq!(
-            limits.max_metadata_size(),
+            limits.max_metadata_size,
             DEFAULT_MAX_LOCAL_CHANNEL_METADATA_SIZE
         );
     }
@@ -900,11 +970,11 @@ mod tests {
     #[test]
     fn receiver_rejects_unsupported_protocol_version() {
         let address = support::test_address();
-        let listener = platform::TransportListener::bind(&address).expect("bind transport");
+        let listener = platform::TransportListener::bind(&address, Access::CurrentSession)
+            .expect("bind transport");
         let receiver_address = address.clone();
-        let receiver_thread = thread::spawn(move || {
-            Receiver::connect(&receiver_address, LocalProtocolLimits::default())
-        });
+        let receiver_thread =
+            thread::spawn(move || Receiver::connect(&receiver_address, ProtocolLimits::default()));
 
         let mut sender_transport = listener.accept().expect("accept transport");
         sender_transport
@@ -982,7 +1052,7 @@ mod tests {
         let mut sender = Sender::new(
             MetadataEncoding::Json,
             sender_transport,
-            LocalProtocolLimits::default(),
+            ProtocolLimits::default(),
         );
         receiver_transport
             .write_all(&[ProtocolTag::ImportFailed as u8])
@@ -1022,7 +1092,7 @@ mod tests {
         let mut sender = Sender::new(
             MetadataEncoding::Json,
             sender_transport,
-            LocalProtocolLimits::default(),
+            ProtocolLimits::default(),
         );
         receiver_transport
             .write_all(&[ProtocolTag::MessageEnvelope as u8])
@@ -1054,9 +1124,8 @@ mod tests {
             .flush()
             .expect("flush unknown protocol tag");
 
-        let err =
-            MessageEnvelope::read_from(&mut receiver_transport, LocalProtocolLimits::default())
-                .expect_err("receiver must reject unknown protocol tag");
+        let err = MessageEnvelope::read_from(&mut receiver_transport, ProtocolLimits::default())
+            .expect_err("receiver must reject unknown protocol tag");
         assert!(matches!(
             err,
             LavaFlowError::ChannelTransportOperation {
@@ -1077,9 +1146,8 @@ mod tests {
             .flush()
             .expect("flush unexpected known protocol tag");
 
-        let err =
-            MessageEnvelope::read_from(&mut receiver_transport, LocalProtocolLimits::default())
-                .expect_err("receiver must reject unexpected known message tag");
+        let err = MessageEnvelope::read_from(&mut receiver_transport, ProtocolLimits::default())
+            .expect_err("receiver must reject unexpected known message tag");
         assert!(matches!(
             err,
             LavaFlowError::ChannelTransportOperation {
@@ -1100,9 +1168,8 @@ mod tests {
             .flush()
             .expect("flush message tag with unknown frame kind");
 
-        let err =
-            MessageEnvelope::read_from(&mut receiver_transport, LocalProtocolLimits::default())
-                .expect_err("receiver must reject unknown frame kind");
+        let err = MessageEnvelope::read_from(&mut receiver_transport, ProtocolLimits::default())
+            .expect_err("receiver must reject unknown frame kind");
         assert!(matches!(
             err,
             LavaFlowError::ChannelTransportOperation {
@@ -1135,9 +1202,8 @@ mod tests {
             .expect("write metadata length");
         sender_transport.flush().expect("flush mismatched message");
 
-        let err =
-            MessageEnvelope::read_from(&mut receiver_transport, LocalProtocolLimits::default())
-                .expect_err("receiver must reject frame kind / handle mismatch");
+        let err = MessageEnvelope::read_from(&mut receiver_transport, ProtocolLimits::default())
+            .expect_err("receiver must reject frame kind / handle mismatch");
         assert!(matches!(
             err,
             LavaFlowError::ChannelTransportOperation {
@@ -1202,7 +1268,7 @@ mod tests {
             Frame::Cpu(buffer),
             MetadataEncoding::Json,
             &FailingMeta,
-            LocalProtocolLimits::default(),
+            ProtocolLimits::default(),
         )
         .expect_err("failing serializer must surface metadata encode error");
         assert!(matches!(
@@ -1277,7 +1343,7 @@ mod tests {
             Frame::Cpu(buffer),
             MetadataEncoding::Json,
             &metadata,
-            LocalProtocolLimits::default(),
+            ProtocolLimits::default(),
         )
         .expect("create message envelope");
 
@@ -1286,7 +1352,7 @@ mod tests {
             .expect("write message envelope directly");
         sender_transport.complete_transfer();
         let read_back =
-            MessageEnvelope::read_from(&mut receiver_transport, LocalProtocolLimits::default())
+            MessageEnvelope::read_from(&mut receiver_transport, ProtocolLimits::default())
                 .expect("read message envelope");
 
         let decoded = read_back
@@ -1302,7 +1368,7 @@ mod tests {
 
     #[test]
     fn message_envelope_write_rejects_payloads_above_configured_limit() {
-        let limits = LocalProtocolLimits::with_max_sizes(
+        let limits = ProtocolLimits::with_max_sizes(
             SMALL_PAYLOAD_LIMIT,
             DEFAULT_MAX_LOCAL_CHANNEL_METADATA_SIZE,
         );
@@ -1332,7 +1398,7 @@ mod tests {
 
     #[test]
     fn message_envelope_write_rejects_metadata_above_configured_limit() {
-        let limits = LocalProtocolLimits::with_max_sizes(
+        let limits = ProtocolLimits::with_max_sizes(
             DEFAULT_MAX_LOCAL_CHANNEL_PAYLOAD_SIZE,
             SMALL_METADATA_LIMIT,
         );
@@ -1365,7 +1431,7 @@ mod tests {
 
     #[test]
     fn receiver_rejects_payload_size_above_configured_limit_when_reading_message_envelope() {
-        let limits = LocalProtocolLimits::with_max_sizes(
+        let limits = ProtocolLimits::with_max_sizes(
             SMALL_PAYLOAD_LIMIT,
             DEFAULT_MAX_LOCAL_CHANNEL_METADATA_SIZE,
         );
@@ -1394,7 +1460,7 @@ mod tests {
 
     #[test]
     fn receiver_rejects_metadata_length_above_configured_limit_when_reading_message_envelope() {
-        let limits = LocalProtocolLimits::with_max_sizes(
+        let limits = ProtocolLimits::with_max_sizes(
             DEFAULT_MAX_LOCAL_CHANNEL_PAYLOAD_SIZE,
             SMALL_METADATA_LIMIT,
         );
@@ -1465,7 +1531,7 @@ mod tests {
         let mut receiver = Receiver::new(
             MetadataEncoding::Json,
             receiver_transport,
-            LocalProtocolLimits::default(),
+            ProtocolLimits::default(),
         );
         let buffer = test_allocator()
             .allocate(BUFFER_SIZE)
@@ -1516,7 +1582,7 @@ mod tests {
         let mut receiver = Receiver::new(
             MetadataEncoding::Json,
             receiver_transport,
-            LocalProtocolLimits::default(),
+            ProtocolLimits::default(),
         );
         let buffer = test_allocator()
             .allocate(BUFFER_SIZE)

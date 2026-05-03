@@ -1,4 +1,4 @@
-use super::{FrameKind, channel_protocol_error, channel_transport_error};
+use super::{Access, FrameKind, channel_protocol_error, channel_transport_error};
 use crate::error::Result;
 use crate::memory::allocator::InterprocessMemoryHandle;
 use crate::types::ChannelId;
@@ -9,13 +9,13 @@ use std::marker::PhantomPinned;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::pin::Pin;
-#[cfg(test)]
-use windows_sys::Win32::Security::WinWorldSid;
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, CopySid, CreateWellKnownSid,
-    GetLengthSid, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
-    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
-    SetSecurityDescriptorDacl, TOKEN_GROUPS, TOKEN_QUERY, TokenGroups,
+    ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, CopySid, GetLengthSid,
+    GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, SECURITY_ATTRIBUTES,
+    SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl, TOKEN_GROUPS, TOKEN_QUERY, TokenGroups,
+};
+use windows_sys::Win32::Security::{
+    CreateWellKnownSid, SECURITY_MAX_SID_SIZE, WinAuthenticatedUserSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_READ_EA, FILE_WRITE_DATA, READ_CONTROL, SYNCHRONIZE,
@@ -27,14 +27,15 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 pub(crate) struct EndpointAddress(String);
 
 impl EndpointAddress {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn from_channel(channel_id: &ChannelId) -> Self {
-        Self(format!(r"\\.\pipe\lava-flow-{}", channel_id.as_str()))
-    }
-
-    #[cfg(test)]
-    pub(in crate::channel::local) fn from_test_channel(channel_id: &ChannelId) -> Self {
-        Self::from_channel(channel_id)
+    pub(crate) fn from_channel(channel_id: &ChannelId, access: Access) -> Self {
+        let access_segment = match access {
+            Access::CurrentSession => "current-session",
+            Access::AuthenticatedUsers => "authenticated-users",
+        };
+        Self(format!(
+            r"\\.\pipe\lava-flow-{access_segment}-{}",
+            channel_id.as_str()
+        ))
     }
 
     pub(super) fn as_str(&self) -> &str {
@@ -142,13 +143,15 @@ struct NamedPipeSecurityDescriptor {
 }
 
 impl NamedPipeSecurityDescriptor {
-    fn current_logon_session(access_mask: PipeAccessMask) -> std::io::Result<Pin<Box<Self>>> {
-        Self::from_sid(access_mask, SYSCALLS.current_logon_session_sid_words()?)
-    }
-
-    #[cfg(test)]
-    fn everyone(access_mask: PipeAccessMask) -> std::io::Result<Pin<Box<Self>>> {
-        Self::from_sid(access_mask, SYSCALLS.well_known_sid_words(WinWorldSid)?)
+    fn for_local_access(
+        access: Access,
+        access_mask: PipeAccessMask,
+    ) -> std::io::Result<Pin<Box<Self>>> {
+        let sid_words = match access {
+            Access::CurrentSession => SYSCALLS.current_logon_session_sid_words()?,
+            Access::AuthenticatedUsers => SYSCALLS.well_known_sid_words(WinAuthenticatedUserSid)?,
+        };
+        Self::from_sid(access_mask, sid_words)
     }
 
     fn from_sid(
@@ -249,9 +252,10 @@ impl TransportSender {
     }
 
     pub(super) fn flush(&mut self) -> Result<()> {
-        self.pipe
-            .flush()
-            .map_err(|source| channel_transport_error("flush", source))
+        match self.pipe.flush() {
+            Ok(()) => Ok(()),
+            Err(source) => Err(channel_transport_error("flush", source)),
+        }
     }
 
     pub(super) fn send_cpu_handle(&mut self, handle: InterprocessMemoryHandle) -> Result<()> {
@@ -317,32 +321,77 @@ impl TransportSender {
 
 #[derive(Debug)]
 pub(super) struct TransportListener {
-    server: OwnedHandle,
+    server: Option<OwnedHandle>,
 }
 
 impl TransportListener {
-    pub(super) fn bind(address: &EndpointAddress) -> Result<Self> {
+    pub(super) fn bind(address: &EndpointAddress, access: Access) -> Result<Self> {
         let mut security =
-            NamedPipeSecurityDescriptor::current_logon_session(local_pipe_client_access_mask())
+            NamedPipeSecurityDescriptor::for_local_access(access, local_pipe_client_access_mask())
                 .map_err(|source| channel_transport_error("build_named_pipe_security", source))?;
         let server = SYSCALLS
             .create_named_pipe(address.as_str(), Some(security.as_mut()))
             .map_err(|source| channel_transport_error("CreateNamedPipeW", source))?;
-        Ok(Self { server })
+        Ok(Self {
+            server: Some(server),
+        })
     }
 
-    pub(super) fn accept(self) -> Result<TransportSender> {
+    pub(super) fn accept(mut self) -> Result<TransportSender> {
+        let server = self
+            .server
+            .take()
+            .expect("transport listener server handle must be present");
         SYSCALLS
-            .connect_named_pipe(self.server.as_raw_handle())
+            .connect_named_pipe(server.as_raw_handle())
             .map_err(|source| channel_transport_error("ConnectNamedPipe", source))?;
+        Self::open_sender(server)
+    }
+
+    pub(super) fn try_accept(&mut self) -> Result<Option<TransportSender>> {
+        use windows_sys::Win32::Foundation::ERROR_PIPE_LISTENING;
+
+        let server = self
+            .server
+            .as_ref()
+            .expect("transport listener server handle must be present");
+        SYSCALLS
+            .set_named_pipe_nowait_mode(server.as_raw_handle())
+            .map_err(|source| channel_transport_error("SetNamedPipeHandleState", source))?;
+        match SYSCALLS.connect_named_pipe(server.as_raw_handle()) {
+            Ok(()) => {
+                if let Err(source) = SYSCALLS.set_named_pipe_wait_mode(server.as_raw_handle()) {
+                    return Err(channel_transport_error("SetNamedPipeHandleState", source));
+                }
+            }
+            Err(source) if source.raw_os_error() == Some(ERROR_PIPE_LISTENING as i32) => {
+                if let Err(source) = SYSCALLS.set_named_pipe_wait_mode(server.as_raw_handle()) {
+                    return Err(channel_transport_error("SetNamedPipeHandleState", source));
+                }
+                return Ok(None);
+            }
+            Err(source) => {
+                let _ = SYSCALLS.set_named_pipe_wait_mode(server.as_raw_handle());
+                return Err(channel_transport_error("ConnectNamedPipe", source));
+            }
+        }
+
+        let server = self
+            .server
+            .take()
+            .expect("transport listener server handle must be present");
+        Self::open_sender(server).map(Some)
+    }
+
+    fn open_sender(server: OwnedHandle) -> Result<TransportSender> {
         let peer_process_id = SYSCALLS
-            .get_named_pipe_client_process_id(self.server.as_raw_handle())
+            .get_named_pipe_client_process_id(server.as_raw_handle())
             .map_err(|source| channel_transport_error("GetNamedPipeClientProcessId", source))?;
         let peer_process = SYSCALLS
             .open_process_duplicatable_handle(peer_process_id)
             .map_err(|source| channel_transport_error("OpenProcess", source))?;
         Ok(TransportSender {
-            pipe: File::from(self.server),
+            pipe: File::from(server),
             peer_process,
             pending_remote_handle: None,
         })
@@ -378,17 +427,25 @@ impl TransportReceiver {
     }
 
     pub(super) fn flush(&mut self) -> Result<()> {
-        self.pipe
-            .flush()
-            .map_err(|source| channel_transport_error("flush", source))
+        match self.pipe.flush() {
+            Ok(()) => Ok(()),
+            Err(source) => Err(channel_transport_error("flush", source)),
+        }
     }
 
     pub(super) fn recv_cpu_handle(&mut self) -> Result<InterprocessMemoryHandle> {
         let mut raw_bytes = [0_u8; 8];
         self.read_exact(&mut raw_bytes)?;
         let raw_value = u64::from_le_bytes(raw_bytes);
-        let raw_usize = usize::try_from(raw_value)
-            .map_err(|_| channel_protocol_error("recv_cpu_handle", "handle value overflow"))?;
+        let raw_usize = match usize::try_from(raw_value) {
+            Ok(value) => value,
+            Err(_) => {
+                return Err(channel_protocol_error(
+                    "recv_cpu_handle",
+                    "handle value overflow",
+                ));
+            }
+        };
         let raw = raw_usize as RawHandle;
         if raw.is_null() || raw as isize == -1 {
             return Err(channel_protocol_error(
@@ -402,7 +459,16 @@ impl TransportReceiver {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn is_retryable_connect_error(operation: &'static str, source: &std::io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
+
+    operation == "CreateFileW"
+        && matches!(
+            source.raw_os_error(),
+            Some(code) if code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_PIPE_BUSY as i32
+        )
+}
+
 trait Syscalls: Sync {
     fn create_named_pipe(
         &self,
@@ -415,6 +481,8 @@ trait Syscalls: Sync {
         access_mask: PipeAccessMask,
     ) -> std::io::Result<OwnedHandle>;
     fn connect_named_pipe(&self, handle: RawHandle) -> std::io::Result<()>;
+    fn set_named_pipe_wait_mode(&self, handle: RawHandle) -> std::io::Result<()>;
+    fn set_named_pipe_nowait_mode(&self, handle: RawHandle) -> std::io::Result<()>;
     fn sid_size(&self, sid_words: &[u32]) -> usize;
     fn current_logon_session_sid_words(&self) -> std::io::Result<Vec<u32>>;
     fn well_known_sid_words(&self, sid_type: i32) -> std::io::Result<Vec<u32>>;
@@ -571,13 +639,12 @@ impl RealSyscalls {
         let count = unsafe { (*groups).GroupCount as usize };
         let first = unsafe { std::ptr::addr_of!((*groups).Groups[0]) };
         let groups_slice = unsafe { std::slice::from_raw_parts(first, count) };
-        let logon_group = groups_slice
-            .iter()
-            .find(|group: &&SID_AND_ATTRIBUTES| {
-                (group.Attributes & SE_GROUP_LOGON_ID as u32) == SE_GROUP_LOGON_ID as u32
-            })
-            .ok_or_else(|| std::io::Error::other("logon sid not found in token groups"))?;
-        Ok(logon_group.Sid)
+        for group in groups_slice {
+            if (group.Attributes & SE_GROUP_LOGON_ID as u32) == SE_GROUP_LOGON_ID as u32 {
+                return Ok(group.Sid);
+            }
+        }
+        Err(std::io::Error::other("logon sid not found in token groups"))
     }
 
     fn copy_sid_words_from_ptr(&self, sid: *mut core::ffi::c_void) -> std::io::Result<Vec<u32>> {
@@ -623,6 +690,34 @@ impl Syscalls for RealSyscalls {
             Ok(())
         } else {
             Err(err)
+        }
+    }
+
+    fn set_named_pipe_wait_mode(&self, handle: RawHandle) -> std::io::Result<()> {
+        use windows_sys::Win32::System::Pipes::{PIPE_WAIT, SetNamedPipeHandleState};
+
+        let mode = PIPE_WAIT;
+        let ok = unsafe {
+            SetNamedPipeHandleState(handle, &mode, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn set_named_pipe_nowait_mode(&self, handle: RawHandle) -> std::io::Result<()> {
+        use windows_sys::Win32::System::Pipes::{PIPE_NOWAIT, SetNamedPipeHandleState};
+
+        let mode = PIPE_NOWAIT;
+        let ok = unsafe {
+            SetNamedPipeHandleState(handle, &mode, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
         }
     }
 
@@ -809,10 +904,17 @@ impl Syscalls for RealSyscalls {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) struct TestRuntimeDirGuard;
+
+#[cfg(test)]
+pub(crate) fn stable_test_runtime_dir_guard(_test_name: &str, _id: u64) -> TestRuntimeDirGuard {
+    TestRuntimeDirGuard
+}
+
+#[cfg(test)]
+pub(in crate::channel::local) mod tests {
     use super::super::tests::support::{
-        BUFFER_SIZE, TestMeta, USED_SIZE, test_address, test_allocator, test_pair,
-        test_transport_pair,
+        BUFFER_SIZE, TestMeta, USED_SIZE, test_allocator, test_pair, test_transport_pair,
     };
     use super::*;
     use crate::{channel::MetadataEncoding, error::LavaFlowError};
@@ -821,10 +923,23 @@ mod tests {
 
     pub(in crate::channel::local) mod support {
         use super::*;
+        use std::sync::{Mutex, MutexGuard, OnceLock};
 
         thread_local! {
             static FAIL_OP_WINDOWS: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
             static REMOTE_CLOSE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+
+        fn failpoint_lock() -> &'static Mutex<()> {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            LOCK.get_or_init(|| Mutex::new(()))
+        }
+
+        pub(in crate::channel::local) fn lock_failpoints() -> MutexGuard<'static, ()> {
+            match failpoint_lock().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            }
         }
 
         pub(in crate::channel::local) fn set_fail(op: &'static str) {
@@ -851,6 +966,14 @@ mod tests {
 
         pub(in crate::channel::local) fn remote_close_calls() -> u32 {
             REMOTE_CLOSE_CALLS.with(|cell| cell.get())
+        }
+
+        pub(in crate::channel::local) fn test_address() -> EndpointAddress {
+            static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let channel_id = ChannelId::new(format!("windows-channel-{id}")).expect("channel id");
+            EndpointAddress::from_channel(&channel_id, Access::CurrentSession)
         }
 
         pub(in crate::channel::local) struct MockSyscalls;
@@ -885,6 +1008,22 @@ mod tests {
                     Err(std::io::Error::other("ConnectNamedPipe failpoint"))
                 } else {
                     RealSyscalls.connect_named_pipe(handle)
+                }
+            }
+
+            fn set_named_pipe_wait_mode(&self, handle: RawHandle) -> std::io::Result<()> {
+                if should_fail("SetNamedPipeHandleState") {
+                    Err(std::io::Error::other("SetNamedPipeHandleState failpoint"))
+                } else {
+                    RealSyscalls.set_named_pipe_wait_mode(handle)
+                }
+            }
+
+            fn set_named_pipe_nowait_mode(&self, handle: RawHandle) -> std::io::Result<()> {
+                if should_fail("SetNamedPipeHandleState") {
+                    Err(std::io::Error::other("SetNamedPipeHandleState failpoint"))
+                } else {
+                    RealSyscalls.set_named_pipe_nowait_mode(handle)
                 }
             }
 
@@ -1006,8 +1145,25 @@ mod tests {
         }
     }
 
+    use support::test_address;
+
+    #[test]
+    fn retry_classifier_accepts_only_startup_race_create_file_errors() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND};
+
+        let missing_pipe = std::io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND as i32);
+        let denied = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
+        let failpoint = std::io::Error::other("CreateFileW failpoint");
+
+        assert!(is_retryable_connect_error("CreateFileW", &missing_pipe));
+        assert!(!is_retryable_connect_error("CreateFileW", &denied));
+        assert!(!is_retryable_connect_error("CreateFileW", &failpoint));
+        assert!(!is_retryable_connect_error("connect", &missing_pipe));
+    }
+
     #[test]
     fn windows_handle_duplicate_failpoint_is_reported() {
+        let _guard = support::lock_failpoints();
         let (mut sender, _receiver) =
             test_pair(MetadataEncoding::Json).expect("create cpu local ipc pair");
         support::set_fail("DuplicateHandle");
@@ -1034,6 +1190,7 @@ mod tests {
 
     #[test]
     fn windows_remote_handle_is_rolled_back_when_handle_value_write_fails() {
+        let _guard = support::lock_failpoints();
         let (mut sender, _receiver) =
             test_pair(MetadataEncoding::Json).expect("create cpu local ipc pair");
         support::reset_remote_close_calls();
@@ -1066,9 +1223,11 @@ mod tests {
 
     #[test]
     fn current_logon_session_builder_reports_sid_lookup_failpoint() {
+        let _guard = support::lock_failpoints();
         support::set_fail("current_logon_session_sid_words");
 
-        let err = match NamedPipeSecurityDescriptor::current_logon_session(
+        let err = match NamedPipeSecurityDescriptor::for_local_access(
+            Access::CurrentSession,
             local_pipe_client_access_mask(),
         ) {
             Ok(_) => panic!("current logon session builder must surface sid lookup failure"),
@@ -1078,21 +1237,44 @@ mod tests {
     }
 
     #[test]
-    fn everyone_builder_reports_sid_lookup_failpoint() {
+    fn authenticated_users_builder_reports_sid_lookup_failpoint() {
+        let _guard = support::lock_failpoints();
         support::set_fail("well_known_sid_words");
 
-        let err = match NamedPipeSecurityDescriptor::everyone(local_pipe_client_access_mask()) {
-            Ok(_) => panic!("everyone builder must surface sid lookup failure"),
+        let err = match NamedPipeSecurityDescriptor::for_local_access(
+            Access::AuthenticatedUsers,
+            local_pipe_client_access_mask(),
+        ) {
+            Ok(_) => panic!("authenticated users builder must surface sid lookup failure"),
             Err(err) => err,
         };
         assert_eq!(err.to_string(), "well_known_sid_words failpoint");
     }
 
     #[test]
+    fn local_access_builder_uses_authenticated_users_security_descriptor() {
+        let _guard = support::lock_failpoints();
+        let address = test_address();
+        support::set_fail("well_known_sid_words");
+
+        let err = TransportListener::bind(&address, Access::AuthenticatedUsers)
+            .expect_err("authenticated users bind must surface sid lookup failure");
+        match err {
+            LavaFlowError::ChannelTransportOperation { operation, source } => {
+                assert_eq!(operation, "build_named_pipe_security");
+                assert_eq!(source.to_string(), "well_known_sid_words failpoint");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn current_logon_session_builder_reports_initialize_acl_failpoint() {
+        let _guard = support::lock_failpoints();
         support::set_fail("InitializeAcl");
 
-        let err = match NamedPipeSecurityDescriptor::current_logon_session(
+        let err = match NamedPipeSecurityDescriptor::for_local_access(
+            Access::CurrentSession,
             local_pipe_client_access_mask(),
         ) {
             Ok(_) => panic!("builder must surface InitializeAcl failure"),
@@ -1103,9 +1285,11 @@ mod tests {
 
     #[test]
     fn current_logon_session_builder_reports_add_access_allowed_ace_failpoint() {
+        let _guard = support::lock_failpoints();
         support::set_fail("AddAccessAllowedAce");
 
-        let err = match NamedPipeSecurityDescriptor::current_logon_session(
+        let err = match NamedPipeSecurityDescriptor::for_local_access(
+            Access::CurrentSession,
             local_pipe_client_access_mask(),
         ) {
             Ok(_) => panic!("builder must surface AddAccessAllowedAce failure"),
@@ -1116,9 +1300,11 @@ mod tests {
 
     #[test]
     fn current_logon_session_builder_reports_initialize_security_descriptor_failpoint() {
+        let _guard = support::lock_failpoints();
         support::set_fail("InitializeSecurityDescriptor");
 
-        let err = match NamedPipeSecurityDescriptor::current_logon_session(
+        let err = match NamedPipeSecurityDescriptor::for_local_access(
+            Access::CurrentSession,
             local_pipe_client_access_mask(),
         ) {
             Ok(_) => panic!("builder must surface InitializeSecurityDescriptor failure"),
@@ -1129,9 +1315,11 @@ mod tests {
 
     #[test]
     fn current_logon_session_builder_reports_set_security_descriptor_dacl_failpoint() {
+        let _guard = support::lock_failpoints();
         support::set_fail("SetSecurityDescriptorDacl");
 
-        let err = match NamedPipeSecurityDescriptor::current_logon_session(
+        let err = match NamedPipeSecurityDescriptor::for_local_access(
+            Access::CurrentSession,
             local_pipe_client_access_mask(),
         ) {
             Ok(_) => panic!("builder must surface SetSecurityDescriptorDacl failure"),
@@ -1142,10 +1330,11 @@ mod tests {
 
     #[test]
     fn bind_reports_create_named_pipe_failpoint() {
+        let _guard = support::lock_failpoints();
         let address = test_address();
         support::set_fail("CreateNamedPipeW");
 
-        let err = TransportListener::bind(&address)
+        let err = TransportListener::bind(&address, Access::CurrentSession)
             .expect_err("bind must report CreateNamedPipeW failpoint");
         assert!(matches!(
             err,
@@ -1158,10 +1347,11 @@ mod tests {
 
     #[test]
     fn bind_reports_named_pipe_security_build_failpoint() {
+        let _guard = support::lock_failpoints();
         let address = test_address();
         support::set_fail("InitializeAcl");
 
-        let err = TransportListener::bind(&address)
+        let err = TransportListener::bind(&address, Access::CurrentSession)
             .expect_err("bind must report security descriptor construction failure");
         assert!(matches!(
             err,
@@ -1174,6 +1364,7 @@ mod tests {
 
     #[test]
     fn connect_reports_create_file_failpoint() {
+        let _guard = support::lock_failpoints();
         let address = test_address();
         support::set_fail("CreateFileW");
 
@@ -1190,8 +1381,10 @@ mod tests {
 
     #[test]
     fn accept_reports_connect_named_pipe_failpoint() {
+        let _guard = support::lock_failpoints();
         let address = test_address();
-        let listener = TransportListener::bind(&address).expect("bind transport listener");
+        let listener = TransportListener::bind(&address, Access::CurrentSession)
+            .expect("bind transport listener");
         support::set_fail("ConnectNamedPipe");
 
         let err = listener
@@ -1207,9 +1400,85 @@ mod tests {
     }
 
     #[test]
-    fn accept_reports_get_named_pipe_client_process_id_failpoint() {
+    fn try_accept_reports_set_named_pipe_handle_state_failpoint() {
+        let _guard = support::lock_failpoints();
         let address = test_address();
-        let listener = TransportListener::bind(&address).expect("bind transport listener");
+        let mut listener = TransportListener::bind(&address, Access::CurrentSession)
+            .expect("bind transport listener");
+        support::set_fail("SetNamedPipeHandleState");
+
+        let err = listener
+            .try_accept()
+            .expect_err("try_accept must report SetNamedPipeHandleState failpoint");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "SetNamedPipeHandleState",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn try_accept_reports_connect_named_pipe_failpoint() {
+        let _guard = support::lock_failpoints();
+        let address = test_address();
+        let mut listener = TransportListener::bind(&address, Access::CurrentSession)
+            .expect("bind transport listener");
+        support::set_fail("ConnectNamedPipe");
+
+        let err = listener
+            .try_accept()
+            .expect_err("try_accept must report ConnectNamedPipe failpoint");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "ConnectNamedPipe",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn try_accept_restores_wait_mode_after_empty_poll() {
+        let address = test_address();
+        let mut listener = TransportListener::bind(&address, Access::CurrentSession)
+            .expect("bind transport listener");
+
+        assert!(
+            listener
+                .try_accept()
+                .expect("empty try_accept should not fail")
+                .is_none()
+        );
+
+        let receiver_address = address.clone();
+        let accept_thread = thread::spawn(move || {
+            let mut sender = listener.accept().expect("blocking accept should wait");
+            sender
+                .write_all(&[0xFA])
+                .expect("write accepted sender byte");
+            sender.flush().expect("flush accepted sender byte");
+        });
+        thread::sleep(std::time::Duration::from_millis(50));
+
+        let mut receiver =
+            TransportReceiver::connect(&receiver_address).expect("connect transport receiver");
+        let mut byte = [0_u8; 1];
+        receiver
+            .read_exact(&mut byte)
+            .expect("read accepted sender byte");
+
+        accept_thread.join().expect("accept thread must not panic");
+        assert_eq!(byte[0], 0xFA);
+    }
+
+    #[test]
+    fn accept_reports_get_named_pipe_client_process_id_failpoint() {
+        let _guard = support::lock_failpoints();
+        let address = test_address();
+        let listener = TransportListener::bind(&address, Access::CurrentSession)
+            .expect("bind transport listener");
         let receiver_address = address.clone();
         let connect_thread = thread::spawn(move || {
             TransportReceiver::connect(&receiver_address).expect("connect receiver")
@@ -1219,6 +1488,9 @@ mod tests {
         let err = listener
             .accept()
             .expect_err("accept must report GetNamedPipeClientProcessId failpoint");
+        let receiver = connect_thread
+            .join()
+            .expect("connect thread must not panic");
         assert!(matches!(
             err,
             LavaFlowError::ChannelTransportOperation {
@@ -1226,17 +1498,15 @@ mod tests {
                 ..
             }
         ));
-        drop(
-            connect_thread
-                .join()
-                .expect("connect thread must not panic"),
-        );
+        drop(receiver);
     }
 
     #[test]
     fn accept_reports_open_process_failpoint() {
+        let _guard = support::lock_failpoints();
         let address = test_address();
-        let listener = TransportListener::bind(&address).expect("bind transport listener");
+        let listener = TransportListener::bind(&address, Access::CurrentSession)
+            .expect("bind transport listener");
         let receiver_address = address.clone();
         let connect_thread = thread::spawn(move || {
             TransportReceiver::connect(&receiver_address).expect("connect receiver")
@@ -1246,6 +1516,9 @@ mod tests {
         let err = listener
             .accept()
             .expect_err("accept must report OpenProcess failpoint");
+        let receiver = connect_thread
+            .join()
+            .expect("connect thread must not panic");
         assert!(matches!(
             err,
             LavaFlowError::ChannelTransportOperation {
@@ -1253,11 +1526,7 @@ mod tests {
                 ..
             }
         ));
-        drop(
-            connect_thread
-                .join()
-                .expect("connect thread must not panic"),
-        );
+        drop(receiver);
     }
 
     #[test]
@@ -1331,7 +1600,89 @@ mod tests {
     }
 
     #[test]
+    fn transport_pair_supports_reverse_control_bytes_directly() {
+        let address = test_address();
+        let listener = TransportListener::bind(&address, Access::CurrentSession)
+            .expect("bind transport listener");
+        let receiver_address = address.clone();
+        let receiver_thread = thread::spawn(move || {
+            let mut receiver =
+                TransportReceiver::connect(&receiver_address).expect("connect transport receiver");
+            receiver
+                .write_all(&[0xAB])
+                .expect("write reverse control byte");
+            receiver.flush().expect("flush reverse control byte");
+
+            let mut reply = [0_u8; 1];
+            receiver
+                .read_exact(&mut reply)
+                .expect("read sender reply byte");
+            reply[0]
+        });
+
+        let mut sender = listener.accept().expect("accept transport sender");
+        let mut received = [0_u8; 1];
+        sender
+            .read_exact(&mut received)
+            .expect("read receiver control byte");
+        assert_eq!(received[0], 0xAB);
+
+        sender.write_all(&[0xCD]).expect("write sender reply byte");
+        sender.flush().expect("flush sender reply byte");
+
+        let reply = receiver_thread
+            .join()
+            .expect("receiver thread must not panic");
+        assert_eq!(reply, 0xCD);
+    }
+
+    #[test]
+    fn transport_sender_reports_read_error_after_receiver_drop() {
+        let (mut sender, receiver) = test_transport_pair().expect("create transport pair");
+        drop(receiver);
+
+        let mut byte = [0_u8; 1];
+        let err = sender
+            .read_exact(&mut byte)
+            .expect_err("read from closed receiver pipe must fail");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation { .. } | LavaFlowError::ChannelDisconnected
+        ));
+    }
+
+    #[test]
+    fn transport_receiver_reports_recv_handle_error_after_sender_drop() {
+        let (sender, mut receiver) = test_transport_pair().expect("create transport pair");
+        drop(sender);
+
+        let err = receiver
+            .recv_cpu_handle()
+            .expect_err("recv handle from closed sender pipe must fail");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation { .. } | LavaFlowError::ChannelDisconnected
+        ));
+    }
+
+    #[test]
+    fn transport_receiver_reports_write_error_after_sender_drop() {
+        let (sender, mut receiver) = test_transport_pair().expect("create transport pair");
+        drop(sender);
+
+        let err = receiver
+            .write_all(&[0xAA])
+            .and_then(|()| receiver.flush())
+            .expect_err("write or flush to closed sender pipe must fail");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation { .. } | LavaFlowError::ChannelDisconnected
+        ));
+    }
+
+    #[test]
     fn abort_transfer_best_effort_handles_remote_close_failpoint() {
+        let _guard = support::lock_failpoints();
         let (mut sender, _receiver) = test_transport_pair().expect("create transport pair");
         support::reset_remote_close_calls();
         let buffer = test_allocator()
@@ -1352,19 +1703,23 @@ mod tests {
     }
 
     #[test]
-    fn allow_everyone_builder_allows_client_open() {
+    fn authenticated_users_builder_allows_client_open() {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let channel_id = ChannelId::new(format!("allow-everyone-{id}")).expect("channel id");
-        let address = EndpointAddress::from_channel(&channel_id);
+        let channel_id =
+            ChannelId::new(format!("allow-authenticated-users-{id}")).expect("channel id");
+        let address = EndpointAddress::from_channel(&channel_id, Access::AuthenticatedUsers);
 
-        let mut security = NamedPipeSecurityDescriptor::everyone(local_pipe_client_access_mask())
-            .expect("build everyone security descriptor");
+        let mut security = NamedPipeSecurityDescriptor::for_local_access(
+            Access::AuthenticatedUsers,
+            local_pipe_client_access_mask(),
+        )
+        .expect("build authenticated-users security descriptor");
 
         let server = SYSCALLS
             .create_named_pipe(address.as_str(), Some(security.as_mut()))
-            .expect("create named pipe with everyone dacl");
+            .expect("create named pipe with authenticated-users dacl");
         let server_handle = server.as_raw_handle() as usize;
         let connect_thread = thread::spawn(move || {
             SYSCALLS
@@ -1374,7 +1729,7 @@ mod tests {
 
         let client = SYSCALLS
             .open_named_pipe_client(address.as_str(), local_pipe_client_access_mask())
-            .expect("open named pipe client with everyone dacl");
+            .expect("open named pipe client with authenticated-users dacl");
 
         connect_thread
             .join()
@@ -1389,11 +1744,13 @@ mod tests {
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let channel_id =
             ChannelId::new(format!("allow-current-logon-session-{id}")).expect("channel id");
-        let address = EndpointAddress::from_channel(&channel_id);
+        let address = EndpointAddress::from_channel(&channel_id, Access::CurrentSession);
 
-        let mut security =
-            NamedPipeSecurityDescriptor::current_logon_session(local_pipe_client_access_mask())
-                .expect("build current-logon-session security descriptor");
+        let mut security = NamedPipeSecurityDescriptor::for_local_access(
+            Access::CurrentSession,
+            local_pipe_client_access_mask(),
+        )
+        .expect("build current-logon-session security descriptor");
 
         let server = SYSCALLS
             .create_named_pipe(address.as_str(), Some(security.as_mut()))

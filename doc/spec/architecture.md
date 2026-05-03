@@ -40,13 +40,15 @@ flowchart LR
 The channel API is symmetric on payload `Frame`, while metadata is exchanged as a separate value.
 
 ```rust
-let tx = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone())
-    .with_metadata_encoding(MetadataEncoding::Cbor)
+let channel_id = ChannelId::new("image-stream")?;
+
+// Sender process. For local scope, build waits until the receiver peer connects.
+let tx = Builder::sender(channel_id.clone(), my_loc.clone(), peer_loc.clone())
+    .with_metadata_encoding(MetadataEncoding::Json)
     .build()?;
 
-let rx = ChannelBuilder::receiver(my_loc, peer_loc)
-    .with_allocator(cpu_allocator)
-    .build()?;
+// Receiver process.
+let rx = Builder::receiver(channel_id, my_loc, peer_loc).build()?;
 
 let meta = ImageMeta {
     used_size: payload_bytes,
@@ -63,14 +65,20 @@ Key points:
 
 - Sender side does not require an allocator.
 - Sender side owns metadata encoding selection; local transports propagate it during connect.
-- Receiver side owns materialization policy via its configured allocator.
+- Current builder inputs include the shared `ChannelId` used for deterministic local rendezvous.
+- Current local builder construction is a peer-process rendezvous: sender `build()` listens and
+  accepts, while receiver `build()` connects. These endpoints are not normally constructed
+  sequentially in one thread.
+- Receiver-side materialization policy remains deferred; the current local builder returns
+  externally shared CPU frames.
 - Endpoint introspection is lightweight: `scope()` and `receive_representation()`.
 - `recv::<M>()` is the default typed path returning `Frame`; `recv_map()` is the dynamic fallback.
 - Metadata always carries `used_size` for payload validity.
-- Current local transports use a versioned tagged binary control protocol with receiver import
-  acknowledgment before `send()` completes.
-- Current local transports also enforce configurable envelope-size limits before metadata allocation
-  or shared-memory import.
+- Current local transports use a versioned tagged control protocol, enforce envelope-size limits,
+  and include platform-specific IPC access controls. See [Channel Semantics](channels.md) for the
+  detailed local protocol and security behavior.
+- Current public builders realize only local scope; remote build paths still fail explicitly until
+  the remote transport layer is added.
 
 ## Transport Routing
 
@@ -118,35 +126,6 @@ implementation.
   2. API stability
   3. coverage completeness
 - Keep test-only fault injection out of production runtime branches.
-
-## Current Local Security
-
-Current local transport hardening is platform-specific:
-
-- Windows named pipes are created with an explicit current-logon-session DACL rather than the
-  default descriptor, and the current implementation uses one duplex pipe per local channel.
-- Unix-domain sockets live under a private per-user runtime directory, not directly under `/tmp`.
-- For Unix runtime-dir resolution, the current order is:
-  - `LAVA_FLOW_RUNTIME_DIR`
-  - `XDG_RUNTIME_DIR/lava-flow/`
-  - `/run/user/<uid>/lava-flow/` when available
-  - `$HOME/.local/run/lava-flow/`
-- The Unix runtime directory is validated as a real directory, not a symlink, owned by the
-  effective user, and forced to `0700`.
-
-This is the current baseline before later peer validation and shared-secret challenge/response are
-added on top.
-
-## Current Local Protocol Limits
-
-Current local CPU IPC rejects oversized envelopes before allocating metadata buffers or importing
-shared-memory payloads.
-
-- default payload cap: `1 GiB`
-- default metadata cap: `1 MiB`
-- limits are configured when the local sender/listener and receiver are constructed
-- later builder defaults should supply those values rather than relying on process-global
-  environment state
 
 ## Related Docs
 

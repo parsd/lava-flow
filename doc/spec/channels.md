@@ -18,13 +18,13 @@ This document defines the channel API and transport behavior for local and remot
 ## API Shape
 
 ```rust
-let tx = ChannelBuilder::sender(my_loc.clone(), peer_loc.clone())
-    .with_metadata_encoding(MetadataEncoding::Cbor)
+let channel_id = ChannelId::new("image-stream")?;
+
+// Sender process.
+let tx = Builder::sender(channel_id.clone(), my_loc.clone(), peer_loc.clone())
+    .with_metadata_encoding(MetadataEncoding::Json)
     .build()?;
 
-let rx = ChannelBuilder::receiver(my_loc, peer_loc)
-    .with_allocator(cpu_allocator)
-    .build()?;
 
 let meta = ImageMeta {
     used_size: payload_bytes,
@@ -33,12 +33,40 @@ let meta = ImageMeta {
 };
 
 tx.send(payload_buffer, &meta)?;
+```
+
+```rust
+let channel_id = ChannelId::new("image-stream")?;
+
+// Receiver process.
+let rx = Builder::receiver(channel_id, my_loc, peer_loc).build()?;
+
 let (frame, meta) = rx.recv::<ImageMeta>()?;
 let used = meta.used_size();
 
 // Dynamic fallback variant
 let (frame, map_meta) = rx.recv_map()?;
 let used = map_meta.used_size;
+```
+
+Convenience constructors for the common local-scope case, still used from separate peers.
+
+```rust
+let local_tx = Builder::local_sender(ChannelId::new("frames")?)?.build()?;
+```
+
+```rust
+let local_tx_with_timeout = Builder::local_sender(ChannelId::new("frames")?)?
+    .build_with_timeout(std::time::Duration::from_secs(2))?;
+```
+
+```rust
+let local_rx = Builder::local_receiver(ChannelId::new("frames")?)?.build()?;
+```
+
+```rust
+let local_rx_with_timeout = Builder::local_receiver(ChannelId::new("frames")?)?
+    .build_with_timeout(std::time::Duration::from_secs(2))?;
 ```
 
 ### Why Distinct Builders
@@ -49,6 +77,7 @@ Distinct builders avoid typestate complexity while preserving normal builder erg
 - receiver options stay receiver-specific
 - modifier ordering remains natural
 - `build()` return type is always unambiguous
+- both sides receive the shared `ChannelId` needed for deterministic local rendezvous naming
 
 ## Endpoint and Payload Model
 
@@ -68,19 +97,19 @@ pub enum ReceiveRepresentation {
 }
 
 impl Sender {
-    pub fn send<M, F>(&self, frame: F, metadata: &M) -> Result<()>
+    pub fn send<M, F>(&mut self, frame: F, metadata: &M) -> Result<()>
     where
         M: Metadata,
         F: Into<Frame>;
-    pub fn send_map<F>(&self, frame: F, metadata: MessageMeta) -> Result<()>
+    pub fn send_map<F>(&mut self, frame: F, metadata: MessageMeta) -> Result<()>
     where
         F: Into<Frame>;
     pub fn scope(&self) -> CommunicationScope;
 }
 
 impl Receiver {
-    pub fn recv<M: Metadata>(&self) -> Result<(Frame, M)>;
-    pub fn recv_map(&self) -> Result<(Frame, MessageMeta)>;
+    pub fn recv<M: Metadata>(&mut self) -> Result<(Frame, M)>;
+    pub fn recv_map(&mut self) -> Result<(Frame, MessageMeta)>;
     pub fn scope(&self) -> CommunicationScope;
     pub fn receive_representation(&self) -> ReceiveRepresentation;
 }
@@ -100,12 +129,23 @@ Rationale:
 Phase 3 local IPC should use an internal listen/connect handshake similar to client/server
 transport setup, but that transport detail stays behind the channel builders.
 
+The public builder model is designed for separate peer processes, not for constructing sender and
+receiver endpoints one after the other in a single thread. In the current local implementation,
+sender `build()` binds the rendezvous endpoint and waits for the receiver process to connect before
+returning a `Sender`; receiver `build()` connects to an already-listening sender. Receivers that may
+start before the sender should use `build_with_timeout(...)`. Supervisors that need to bound or
+cancel endpoint construction can use `build_with_timeout(...)`, `build_or_cancelled(...)`, or
+`build_with_timeout_or_cancel(...)` on the blocking builder.
+
 Public intent:
 
 - users provide a shared logical channel identifier
-- the library derives the local rendezvous endpoint from that channel id
+- the library derives the local rendezvous endpoint from that channel id and the selected local
+  access policy
 - one side acts as transport server and performs `listen` / `accept`
 - the other side acts as transport client and performs `connect`
+- both peers must choose the same local access policy; mixed policies intentionally use different
+  rendezvous endpoints and do not connect
 - sender-configured metadata encoding is communicated during connection bootstrap
 - after connection, message flow stays normal `send` / `recv`
 - local transports use a small versioned binary protocol rather than serializing Rust structs
@@ -168,6 +208,33 @@ Per-message flow:
 This means `send()` is synchronous at the protocol level: it completes only after the receiver has
 either accepted the imported handle or rejected it.
 
+Current builder surface:
+
+- `Builder::sender(channel_id, my_location, peer_location)`
+- `Builder::receiver(channel_id, my_location, peer_location)`
+- `Builder::local_sender(channel_id)` / `Builder::local_receiver(channel_id)` for the common
+  same-host case using `ProcessLocation::from_hostname()`
+- local sender `build()` is a blocking accept step and returns only after the receiver peer connects
+- sender builder currently exposes:
+  - metadata encoding
+  - local access convenience methods:
+    - `with_current_session_local_access()` for the default current logon session / Unix user policy
+    - `with_authenticated_users_local_access()` for explicitly shared local IPC between local users
+  - local maximum payload size
+  - local maximum metadata size
+  - optional `build_with_timeout(timeout)` for bounded waits while accepting a receiver
+  - optional cancellation via `BuildCancel`, `build_or_cancelled(...)`, and
+    `build_with_timeout_or_cancel(...)`
+- receiver builder currently exposes:
+  - the same local access convenience methods as the sender builder
+  - local maximum payload size
+  - local maximum metadata size
+  - optional `build_with_timeout(timeout)` for startup-tolerant local connects
+  - optional cancellation via `BuildCancel`, `build_or_cancelled(...)`, and
+    `build_with_timeout_or_cancel(...)`
+- current public builder implementation realizes only local scope; remote build paths fail
+  explicitly until the remote transport layer is added
+
 Local envelope size limits:
 
 - local transports enforce explicit payload-size and metadata-size limits on both send and receive
@@ -185,19 +252,27 @@ Windows:
 
 - local CPU IPC uses one duplex named pipe for bootstrap, envelopes, and import ACK/NACK traffic
 - the named pipe is created with an explicit DACL rather than the Windows default
-- the current implementation grants access to the current logon session only
+- the default current-session local access policy grants access to the current logon session only
+- the authenticated-users local access policy grants access to the Windows Authenticated Users SID;
+  it does not use the broader Everyone SID
 - the granted access mask is aligned with the actual duplex client open mode used by the transport
 
 Unix:
 
 - local CPU IPC uses Unix-domain sockets with `SCM_RIGHTS` for fd transfer
-- the socket path is derived under a private per-user runtime directory
+- the default current-session local access policy derives the socket path under a private per-user
+  runtime directory
 - `LAVA_FLOW_RUNTIME_DIR` is preferred as an explicit override for orchestrated/container setups
 - otherwise `XDG_RUNTIME_DIR/lava-flow/` is used when available
 - if `XDG_RUNTIME_DIR` is unset, `/run/user/<uid>/lava-flow/` is used when that runtime base exists
 - otherwise the fallback is `$HOME/.local/run/lava-flow/`
-- the runtime directory is created with `0700` permissions before bind
+- the runtime directory is created with `0700` (`rwx------`) permissions before bind; `0600` is not
+  sufficient for a directory because execute/search permission is required to traverse it and create
+  or remove the socket entry
 - the runtime directory must not be a symlink and must be owned by the effective user
+- the authenticated-users local access policy uses a socket path directly under the system
+  temporary directory and sets the socket mode to `0666` (`rw-rw-rw-`); the parent directory must be
+  sticky and writable by other users
 
 These measures reduce cross-user access to local IPC endpoints before the later shared-secret
 challenge/response hardening is added.
