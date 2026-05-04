@@ -53,6 +53,7 @@ Implemented backend abstraction:
   - logical `size()` (payload bytes)
   - `allocation_size()` (Vulkan-required backing bytes)
   - external-handle metadata
+  - internal external-handle import/export for channel transports
 - GPU allocator construction fails when backend is unavailable/disabled
 - GPU allocation path does not expose host-mapped pointer access in the public API
 
@@ -106,6 +107,11 @@ Handle export behavior:
 
 - GPU buffer: exports GPU external handle metadata
 - CPU buffer: exports CPU shared-memory transport handle
+
+Handle import behavior:
+
+- GPU buffer: imports GPU external handles into a Vulkan buffer on the selected logical device
+- CPU buffer: imports CPU shared-memory transport handles
 
 ## Platform Implementation Layout
 

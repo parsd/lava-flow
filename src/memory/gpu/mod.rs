@@ -32,6 +32,58 @@ pub struct MemoryBuffer {
 }
 
 impl MemoryBuffer {
+    /// Imports a GPU external-memory handle into a Vulkan buffer on `device_id`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_shared_handle(
+        device_id: u32,
+        size: usize,
+        handle: InterprocessMemoryHandle,
+    ) -> Result<Self> {
+        if size == 0 {
+            return Err(LavaFlowError::InvalidAllocationRequest {
+                size,
+                reason: AllocationReason::ZeroSize,
+            });
+        }
+        let retained_external_handle =
+            ExternalHandle::from_interprocess_handle(handle.try_clone()?)?;
+        let context = Arc::new(DeviceContext::new(device_id)?);
+        let buffer = OwnedBuffer::create(&context, size)?;
+        let memory_requirements =
+            VULKAN_API.buffer_memory_requirements(&context.device, buffer.as_raw());
+        let allocation_size = memory_requirements.size;
+        if allocation_size < size as u64 {
+            return Err(vulkan_operation_error(
+                "get_buffer_memory_requirements",
+                format!(
+                    "allocation size {} smaller than requested {}",
+                    allocation_size, size
+                ),
+            ));
+        }
+        let memory_type_index =
+            context.resolve_memory_type_index(memory_requirements.memory_type_bits)?;
+        let memory = OwnedMemory::import(
+            &context,
+            buffer.as_raw(),
+            allocation_size,
+            memory_type_index,
+            handle,
+        )?;
+        VULKAN_API.bind_buffer_memory(&context.device, buffer.as_raw(), memory.as_raw())?;
+        let buffer = buffer.into_raw();
+        let memory = memory.into_raw();
+
+        Ok(Self {
+            context,
+            size,
+            allocation_size,
+            buffer,
+            memory,
+            external_handle: retained_external_handle,
+        })
+    }
+
     /// Returns the buffer size in bytes.
     pub fn size(&self) -> usize {
         self.size
@@ -365,6 +417,23 @@ impl<'a> OwnedMemory<'a> {
         Ok(Self { context, memory })
     }
 
+    fn import(
+        context: &'a DeviceContext,
+        buffer: vk::Buffer,
+        allocation_size: u64,
+        memory_type_index: u32,
+        handle: InterprocessMemoryHandle,
+    ) -> Result<Self> {
+        let memory = VULKAN_API.import_memory_handle(
+            context,
+            buffer,
+            allocation_size,
+            memory_type_index,
+            handle,
+        )?;
+        Ok(Self { context, memory })
+    }
+
     fn as_raw(&self) -> vk::DeviceMemory {
         self.memory
     }
@@ -433,6 +502,14 @@ trait VulkanApi: Sync {
         context: &DeviceContext,
         memory: vk::DeviceMemory,
     ) -> Result<ExternalHandle>;
+    fn import_memory_handle(
+        &self,
+        context: &DeviceContext,
+        buffer: vk::Buffer,
+        allocation_size: u64,
+        memory_type_index: u32,
+        handle: InterprocessMemoryHandle,
+    ) -> Result<vk::DeviceMemory>;
 }
 
 struct RealVulkanApi;
@@ -544,6 +621,17 @@ impl VulkanApi for RealVulkanApi {
     ) -> Result<ExternalHandle> {
         context.export_memory_handle(memory)
     }
+
+    fn import_memory_handle(
+        &self,
+        context: &DeviceContext,
+        buffer: vk::Buffer,
+        allocation_size: u64,
+        memory_type_index: u32,
+        handle: InterprocessMemoryHandle,
+    ) -> Result<vk::DeviceMemory> {
+        context.import_memory_handle(buffer, allocation_size, memory_type_index, handle)
+    }
 }
 
 #[cfg(not(test))]
@@ -561,6 +649,10 @@ fn vulkan_operation_error(operation: &'static str, details: impl Into<String>) -
         operation,
         details: details.into(),
     }
+}
+
+fn unsupported_interprocess_handle(kind: &'static str) -> LavaFlowError {
+    LavaFlowError::UnsupportedInterprocessHandle { kind }
 }
 
 #[cfg(test)]
@@ -589,6 +681,7 @@ mod tests {
         BindMemory,
         ExportHandle,
         ExportHandleSyscall,
+        ImportHandle,
     }
 
     pub(super) mod support {
@@ -769,6 +862,29 @@ mod tests {
                 }
                 RealVulkanApi.export_memory_handle(context, memory)
             }
+
+            fn import_memory_handle(
+                &self,
+                context: &DeviceContext,
+                buffer: vk::Buffer,
+                allocation_size: u64,
+                memory_type_index: u32,
+                handle: InterprocessMemoryHandle,
+            ) -> Result<vk::DeviceMemory> {
+                if should_fail(FailPoint::ImportHandle) {
+                    return Err(vulkan_operation_error(
+                        "import_memory_handle",
+                        "forced test failure",
+                    ));
+                }
+                RealVulkanApi.import_memory_handle(
+                    context,
+                    buffer,
+                    allocation_size,
+                    memory_type_index,
+                    handle,
+                )
+            }
         }
     }
 
@@ -805,6 +921,14 @@ mod tests {
 
     fn allocator_instance_handle(allocator: &Allocator) -> u64 {
         allocator.context._runtime.instance.handle().as_raw()
+    }
+
+    fn cpu_shared_handle_for_test() -> InterprocessMemoryHandle {
+        crate::memory::cpu::Allocator::with_max_allocation_size(usize::MAX)
+            .allocate(BUFFER_SIZE)
+            .expect("allocate cpu buffer")
+            .shared_handle()
+            .expect("export cpu shared handle")
     }
 
     struct OwnedInstance {
@@ -991,6 +1115,49 @@ mod tests {
                 handle,
                 InterprocessMemoryHandle::GpuOpaqueWin32Handle(_)
             ));
+        });
+    }
+
+    #[test]
+    fn from_shared_handle_rejects_zero_size_before_backend_creation() {
+        let err =
+            MemoryBuffer::from_shared_handle(DEFAULT_DEVICE_ID, 0, cpu_shared_handle_for_test())
+                .expect_err("zero-sized import must fail");
+
+        assert!(matches!(
+            err,
+            LavaFlowError::InvalidAllocationRequest {
+                size: 0,
+                reason: AllocationReason::ZeroSize,
+            }
+        ));
+    }
+
+    #[test]
+    fn from_shared_handle_reports_forced_import_failure() {
+        with_allocator(|allocator| {
+            let buffer = allocator
+                .allocate(BUFFER_SIZE)
+                .expect("allocate gpu buffer");
+            let handle = buffer.shared_handle().expect("export handle");
+            set_fail_point(FailPoint::ImportHandle);
+
+            let err = MemoryBuffer::from_shared_handle(allocator.device_id(), BUFFER_SIZE, handle)
+                .expect_err("forced import failure");
+
+            assert_error_matches(
+                &err,
+                "LavaFlowError::VulkanOperation { operation: \"import_memory_handle\", .. }",
+                |err| {
+                    matches!(
+                        err,
+                        LavaFlowError::VulkanOperation {
+                            operation: "import_memory_handle",
+                            ..
+                        }
+                    )
+                },
+            );
         });
     }
 

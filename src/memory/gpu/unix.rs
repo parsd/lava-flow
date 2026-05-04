@@ -1,7 +1,10 @@
-use super::{DeviceContext, Result, vulkan_operation_error};
+use super::{
+    DeviceContext, Result, VULKAN_API, VulkanApi, unsupported_interprocess_handle,
+    vulkan_operation_error,
+};
 use crate::memory::allocator::InterprocessMemoryHandle;
 use ash::vk;
-use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 
 pub(super) const EXTERNAL_MEMORY_HANDLE_TYPE: vk::ExternalMemoryHandleTypeFlags =
     vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD;
@@ -37,6 +40,15 @@ impl ExternalMemoryDevice {
 pub(super) struct ExternalHandle(OwnedFd);
 
 impl ExternalHandle {
+    pub(super) fn from_interprocess_handle(handle: InterprocessMemoryHandle) -> Result<Self> {
+        match handle {
+            InterprocessMemoryHandle::GpuOpaqueFd(fd) => Ok(Self(fd)),
+            InterprocessMemoryHandle::CpuSharedFd(_) => {
+                Err(unsupported_interprocess_handle("CpuSharedFd"))
+            }
+        }
+    }
+
     pub(super) fn duplicate_for_ipc(&self) -> Result<InterprocessMemoryHandle> {
         let duplicated = self
             .0
@@ -58,13 +70,50 @@ impl DeviceContext {
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
         Ok(ExternalHandle(owned))
     }
+
+    pub(super) fn import_memory_handle(
+        &self,
+        buffer: vk::Buffer,
+        allocation_size: u64,
+        memory_type_index: u32,
+        handle: InterprocessMemoryHandle,
+    ) -> Result<vk::DeviceMemory> {
+        let fd = match handle {
+            InterprocessMemoryHandle::GpuOpaqueFd(fd) => fd,
+            InterprocessMemoryHandle::CpuSharedFd(_) => {
+                return Err(unsupported_interprocess_handle("CpuSharedFd"));
+            }
+        };
+        let mut import_memory_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(EXTERNAL_MEMORY_HANDLE_TYPE)
+            .fd(fd.as_raw_fd());
+        let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(allocation_size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut import_memory_info)
+            .push_next(&mut dedicated_info);
+        let memory = VULKAN_API.allocate_memory(&self.device, &alloc_info)?;
+        // OPAQUE_FD import transfers fd ownership to Vulkan on successful import.
+        let _ = fd.into_raw_fd();
+        Ok(memory)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::LavaFlowError;
 
     const BUFFER_SIZE: usize = 64;
+
+    fn cpu_shared_handle_for_test() -> InterprocessMemoryHandle {
+        crate::memory::cpu::Allocator::with_max_allocation_size(usize::MAX)
+            .allocate(BUFFER_SIZE)
+            .expect("allocate cpu buffer")
+            .shared_handle()
+            .expect("export cpu shared handle")
+    }
 
     #[test]
     fn export_memory_handle_and_duplicate_for_ipc_directly() {
@@ -79,5 +128,47 @@ mod tests {
             let handle = external.duplicate_for_ipc().expect("duplicate for ipc");
             assert!(matches!(handle, InterprocessMemoryHandle::GpuOpaqueFd(_)));
         }
+    }
+
+    #[test]
+    fn from_shared_handle_imports_exported_gpu_handle() {
+        if let Ok(allocator) = super::super::Allocator::new() {
+            let buffer = allocator
+                .allocate(BUFFER_SIZE)
+                .expect("allocate gpu buffer");
+            let handle = buffer.shared_handle().expect("export handle");
+            let imported = super::super::MemoryBuffer::from_shared_handle(
+                allocator.device_id(),
+                BUFFER_SIZE,
+                handle,
+            )
+            .expect("import gpu handle");
+
+            assert_eq!(imported.device_id(), allocator.device_id());
+            assert_eq!(imported.size(), BUFFER_SIZE);
+            assert!(imported.allocation_size() >= BUFFER_SIZE as u64);
+            let reexported = imported.shared_handle().expect("re-export imported handle");
+            assert!(matches!(
+                reexported,
+                InterprocessMemoryHandle::GpuOpaqueFd(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn from_shared_handle_rejects_cpu_handle_before_backend_creation() {
+        let err = super::super::MemoryBuffer::from_shared_handle(
+            super::super::DEFAULT_DEVICE_ID,
+            BUFFER_SIZE,
+            cpu_shared_handle_for_test(),
+        )
+        .expect_err("cpu handle must not be accepted as gpu import");
+
+        assert!(matches!(
+            err,
+            LavaFlowError::UnsupportedInterprocessHandle {
+                kind: "CpuSharedFd",
+            }
+        ));
     }
 }
