@@ -914,7 +914,7 @@ pub(crate) fn stable_test_runtime_dir_guard(_test_name: &str, _id: u64) -> TestR
 #[cfg(test)]
 pub(in crate::channel::local) mod tests {
     use super::super::tests::support::{
-        BUFFER_SIZE, TestMeta, USED_SIZE, test_allocator, test_pair, test_transport_pair,
+        BUFFER_SIZE, TestMeta, test_allocator, test_pair, test_transport_pair,
     };
     use super::*;
     use crate::{channel::MetadataEncoding, error::LavaFlowError};
@@ -1171,7 +1171,6 @@ pub(in crate::channel::local) mod tests {
             .allocate(BUFFER_SIZE)
             .expect("allocate payload");
         let metadata = TestMeta {
-            used_size: USED_SIZE,
             width: 32,
             height: 32,
         };
@@ -1199,7 +1198,6 @@ pub(in crate::channel::local) mod tests {
             .allocate(BUFFER_SIZE)
             .expect("allocate payload");
         let metadata = TestMeta {
-            used_size: USED_SIZE,
             width: 32,
             height: 32,
         };
@@ -1226,13 +1224,12 @@ pub(in crate::channel::local) mod tests {
         let _guard = support::lock_failpoints();
         support::set_fail("current_logon_session_sid_words");
 
-        let err = match NamedPipeSecurityDescriptor::for_local_access(
+        let err = NamedPipeSecurityDescriptor::for_local_access(
             Access::CurrentSession,
             local_pipe_client_access_mask(),
-        ) {
-            Ok(_) => panic!("current logon session builder must surface sid lookup failure"),
-            Err(err) => err,
-        };
+        )
+        .err()
+        .expect("current logon session builder must surface sid lookup failure");
         assert_eq!(err.to_string(), "current_logon_session_sid_words failpoint");
     }
 
@@ -1241,13 +1238,12 @@ pub(in crate::channel::local) mod tests {
         let _guard = support::lock_failpoints();
         support::set_fail("well_known_sid_words");
 
-        let err = match NamedPipeSecurityDescriptor::for_local_access(
+        let err = NamedPipeSecurityDescriptor::for_local_access(
             Access::AuthenticatedUsers,
             local_pipe_client_access_mask(),
-        ) {
-            Ok(_) => panic!("authenticated users builder must surface sid lookup failure"),
-            Err(err) => err,
-        };
+        )
+        .err()
+        .expect("authenticated users builder must surface sid lookup failure");
         assert_eq!(err.to_string(), "well_known_sid_words failpoint");
     }
 
@@ -1259,13 +1255,13 @@ pub(in crate::channel::local) mod tests {
 
         let err = TransportListener::bind(&address, Access::AuthenticatedUsers)
             .expect_err("authenticated users bind must surface sid lookup failure");
-        match err {
-            LavaFlowError::ChannelTransportOperation { operation, source } => {
-                assert_eq!(operation, "build_named_pipe_security");
-                assert_eq!(source.to_string(), "well_known_sid_words failpoint");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "build_named_pipe_security",
+                ref source,
+            } if source.to_string() == "well_known_sid_words failpoint"
+        ));
     }
 
     #[test]
@@ -1273,13 +1269,12 @@ pub(in crate::channel::local) mod tests {
         let _guard = support::lock_failpoints();
         support::set_fail("InitializeAcl");
 
-        let err = match NamedPipeSecurityDescriptor::for_local_access(
+        let err = NamedPipeSecurityDescriptor::for_local_access(
             Access::CurrentSession,
             local_pipe_client_access_mask(),
-        ) {
-            Ok(_) => panic!("builder must surface InitializeAcl failure"),
-            Err(err) => err,
-        };
+        )
+        .err()
+        .expect("builder must surface InitializeAcl failure");
         assert_eq!(err.to_string(), "InitializeAcl failpoint");
     }
 
@@ -1288,13 +1283,12 @@ pub(in crate::channel::local) mod tests {
         let _guard = support::lock_failpoints();
         support::set_fail("AddAccessAllowedAce");
 
-        let err = match NamedPipeSecurityDescriptor::for_local_access(
+        let err = NamedPipeSecurityDescriptor::for_local_access(
             Access::CurrentSession,
             local_pipe_client_access_mask(),
-        ) {
-            Ok(_) => panic!("builder must surface AddAccessAllowedAce failure"),
-            Err(err) => err,
-        };
+        )
+        .err()
+        .expect("builder must surface AddAccessAllowedAce failure");
         assert_eq!(err.to_string(), "AddAccessAllowedAce failpoint");
     }
 
@@ -1303,13 +1297,12 @@ pub(in crate::channel::local) mod tests {
         let _guard = support::lock_failpoints();
         support::set_fail("InitializeSecurityDescriptor");
 
-        let err = match NamedPipeSecurityDescriptor::for_local_access(
+        let err = NamedPipeSecurityDescriptor::for_local_access(
             Access::CurrentSession,
             local_pipe_client_access_mask(),
-        ) {
-            Ok(_) => panic!("builder must surface InitializeSecurityDescriptor failure"),
-            Err(err) => err,
-        };
+        )
+        .err()
+        .expect("builder must surface InitializeSecurityDescriptor failure");
         assert_eq!(err.to_string(), "InitializeSecurityDescriptor failpoint");
     }
 
@@ -1318,13 +1311,12 @@ pub(in crate::channel::local) mod tests {
         let _guard = support::lock_failpoints();
         support::set_fail("SetSecurityDescriptorDacl");
 
-        let err = match NamedPipeSecurityDescriptor::for_local_access(
+        let err = NamedPipeSecurityDescriptor::for_local_access(
             Access::CurrentSession,
             local_pipe_client_access_mask(),
-        ) {
-            Ok(_) => panic!("builder must surface SetSecurityDescriptorDacl failure"),
-            Err(err) => err,
-        };
+        )
+        .err()
+        .expect("builder must surface SetSecurityDescriptorDacl failure");
         assert_eq!(err.to_string(), "SetSecurityDescriptorDacl failpoint");
     }
 

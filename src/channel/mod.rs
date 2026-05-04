@@ -420,10 +420,13 @@ impl TryFrom<u8> for MetadataEncoding {
 }
 
 /// User-defined typed metadata contract for channel payloads.
-pub trait Metadata: Serialize + DeserializeOwned {
-    /// Returns the number of payload bytes that are valid for this message.
-    fn used_size(&self) -> usize;
-}
+///
+/// Any serde-serializable and deserializable type can be used as metadata. Buffer sizing is carried
+/// by the channel protocol; applications may include their own valid-byte count or other payload
+/// interpretation fields when needed.
+pub trait Metadata: Serialize + DeserializeOwned {}
+
+impl<T> Metadata for T where T: Serialize + DeserializeOwned {}
 
 /// Dynamic metadata value used by schema-less receive paths.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -449,16 +452,8 @@ pub enum MetaValue {
 /// Dynamic metadata envelope for schema-less receive operations.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MessageMeta {
-    /// Number of payload bytes that are valid for this message.
-    pub used_size: usize,
-    /// Additional metadata fields.
+    /// Dynamic metadata fields.
     pub values: BTreeMap<String, MetaValue>,
-}
-
-impl Metadata for MessageMeta {
-    fn used_size(&self) -> usize {
-        self.used_size
-    }
 }
 
 /// Observable receive behavior for a receiver endpoint.
@@ -617,15 +612,8 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct PublicTestMeta {
-        used_size: usize,
         width: u32,
         height: u32,
-    }
-
-    impl Metadata for PublicTestMeta {
-        fn used_size(&self) -> usize {
-            self.used_size
-        }
     }
 
     fn build_local_receiver_with_limits(
@@ -641,6 +629,7 @@ mod tests {
                 ProcessLocation::new("node-0").expect("receiver location"),
                 ProcessLocation::new("node-0").expect("sender location"),
             )
+            .with_current_session_local_access()
             .with_local_max_payload_size(max_payload)
             .with_local_max_metadata_size(max_metadata)
             .build()
@@ -697,15 +686,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn message_meta_used_size_returns_stored_value() {
-        let meta = MessageMeta {
-            used_size: 17,
-            values: BTreeMap::new(),
-        };
-        assert_eq!(meta.used_size(), 17);
     }
 
     #[test]
@@ -766,7 +746,6 @@ mod tests {
         .build()
         .expect("build sender");
         let metadata = MessageMeta {
-            used_size: 12,
             values: BTreeMap::from([("count".into(), MetaValue::U64(7))]),
         };
         let buffer = cpu::Allocator::with_max_allocation_size(usize::MAX)
@@ -793,7 +772,6 @@ mod tests {
             ChannelId::new(format!("builder-local-typed-round-trip-{id}")).expect("channel id");
         let receiver_channel_id = channel_id.clone();
         let expected = PublicTestMeta {
-            used_size: 16,
             width: 800,
             height: 600,
         };
@@ -851,7 +829,6 @@ mod tests {
             .allocate(64)
             .expect("allocate payload");
         let metadata = MessageMeta {
-            used_size: 8,
             values: BTreeMap::new(),
         };
 
@@ -892,7 +869,6 @@ mod tests {
             .allocate(64)
             .expect("allocate payload");
         let metadata = MessageMeta {
-            used_size: 8,
             values: BTreeMap::from([("blob".into(), MetaValue::Bytes(vec![1_u8; 32]))]),
         };
 
@@ -927,7 +903,6 @@ mod tests {
             .build()
             .expect("build sender");
         let metadata = MessageMeta {
-            used_size: 9,
             values: BTreeMap::from([("flag".into(), MetaValue::Bool(true))]),
         };
         let buffer = cpu::Allocator::with_max_allocation_size(usize::MAX)
@@ -973,7 +948,6 @@ mod tests {
         .build_with_timeout(Duration::from_secs(2))
         .expect("build authenticated-users sender");
         let metadata = MessageMeta {
-            used_size: 21,
             values: BTreeMap::from([("access".into(), MetaValue::String("auth".into()))]),
         };
         let buffer = cpu::Allocator::with_max_allocation_size(usize::MAX)
@@ -1015,22 +989,18 @@ mod tests {
         .build_with_timeout(Duration::from_millis(50))
         .expect_err("receiver must not connect to sender using a different access policy");
 
-        match receiver_err {
-            LavaFlowError::ChannelTransportOperation { operation, source } => {
-                assert_eq!(operation, "connect");
-                assert_eq!(source.kind(), io::ErrorKind::TimedOut);
-            }
-            other => panic!("unexpected receiver error: {other:?}"),
-        }
+        assert!(matches!(
+            receiver_err,
+            LavaFlowError::ChannelTransportOperation { operation: "connect", ref source }
+                if source.kind() == io::ErrorKind::TimedOut
+        ));
 
         let sender_err = sender_thread.join().expect("sender thread must not panic");
-        match sender_err {
-            LavaFlowError::ChannelTransportOperation { operation, source } => {
-                assert_eq!(operation, "accept");
-                assert_eq!(source.kind(), io::ErrorKind::TimedOut);
-            }
-            other => panic!("unexpected sender error: {other:?}"),
-        }
+        assert!(matches!(
+            sender_err,
+            LavaFlowError::ChannelTransportOperation { operation: "accept", ref source }
+                if source.kind() == io::ErrorKind::TimedOut
+        ));
     }
 
     #[test]
@@ -1047,13 +1017,11 @@ mod tests {
         .build_with_timeout(Duration::from_millis(50))
         .expect_err("receiver connect should time out");
 
-        match err {
-            LavaFlowError::ChannelTransportOperation { operation, source } => {
-                assert_eq!(operation, "connect");
-                assert_eq!(source.kind(), io::ErrorKind::TimedOut);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation { operation: "connect", ref source }
+                if source.kind() == io::ErrorKind::TimedOut
+        ));
     }
 
     #[test]
@@ -1070,13 +1038,11 @@ mod tests {
         .build_with_timeout(Duration::from_millis(50))
         .expect_err("sender accept should time out");
 
-        match err {
-            LavaFlowError::ChannelTransportOperation { operation, source } => {
-                assert_eq!(operation, "accept");
-                assert_eq!(source.kind(), io::ErrorKind::TimedOut);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation { operation: "accept", ref source }
+                if source.kind() == io::ErrorKind::TimedOut
+        ));
     }
 
     #[test]
@@ -1168,7 +1134,6 @@ mod tests {
         .build()
         .expect("build sender");
         let metadata = MessageMeta {
-            used_size: 11,
             values: BTreeMap::from([("delayed".into(), MetaValue::Bool(true))]),
         };
         let buffer = cpu::Allocator::with_max_allocation_size(usize::MAX)
@@ -1212,7 +1177,6 @@ mod tests {
         .build()
         .expect("build sender");
         let metadata = MessageMeta {
-            used_size: 13,
             values: BTreeMap::from([("receiver-combined".into(), MetaValue::Bool(true))]),
         };
         let buffer = cpu::Allocator::with_max_allocation_size(usize::MAX)
@@ -1235,7 +1199,6 @@ mod tests {
         let channel_id = ChannelId::new(format!("tx-combo-{id}")).expect("channel id");
         let sender_channel_id = channel_id.clone();
         let expected = MessageMeta {
-            used_size: 17,
             values: BTreeMap::from([("sender-combined".into(), MetaValue::Bool(true))]),
         };
         let sender_metadata = expected.clone();

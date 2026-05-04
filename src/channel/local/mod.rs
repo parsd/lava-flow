@@ -182,8 +182,10 @@ impl ProtocolTag {
     ) -> Result<Self> {
         let mut tag = [0_u8; 1];
         transport.read_exact(&mut tag)?;
-        Self::try_from(tag[0])
-            .map_err(|_| channel_protocol_error(operation, "unknown protocol tag"))
+        match Self::try_from(tag[0]) {
+            Ok(tag) => Ok(tag),
+            Err(_) => Err(channel_protocol_error(operation, "unknown protocol tag")),
+        }
     }
 
     fn read_from_receiver(
@@ -192,8 +194,10 @@ impl ProtocolTag {
     ) -> Result<Self> {
         let mut tag = [0_u8; 1];
         transport.read_exact(&mut tag)?;
-        Self::try_from(tag[0])
-            .map_err(|_| channel_protocol_error(operation, "unknown protocol tag"))
+        match Self::try_from(tag[0]) {
+            Ok(tag) => Ok(tag),
+            Err(_) => Err(channel_protocol_error(operation, "unknown protocol tag")),
+        }
     }
 }
 
@@ -215,6 +219,82 @@ impl TryFrom<u8> for FrameKind {
                 "decode_frame_kind",
                 "unknown frame kind",
             )),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum FrameHeader {
+    Cpu { buffer_size: usize },
+    Gpu { buffer_size: usize, device_id: u32 },
+}
+
+impl FrameHeader {
+    fn from_frame(frame: &Frame) -> Self {
+        match frame {
+            Frame::Cpu(buffer) => Self::Cpu {
+                buffer_size: buffer.size(),
+            },
+            Frame::Gpu(buffer) => Self::Gpu {
+                buffer_size: buffer.size(),
+                device_id: buffer.device_id(),
+            },
+        }
+    }
+
+    fn kind(self) -> FrameKind {
+        match self {
+            Self::Cpu { .. } => FrameKind::Cpu,
+            Self::Gpu { .. } => FrameKind::Gpu,
+        }
+    }
+
+    fn buffer_size(self) -> usize {
+        match self {
+            Self::Cpu { buffer_size } | Self::Gpu { buffer_size, .. } => buffer_size,
+        }
+    }
+
+    fn write_to(self, transport: &mut platform::TransportSender) -> Result<()> {
+        transport.write_all(&[self.kind() as u8])?;
+        transport.write_all(&(self.buffer_size() as u64).to_le_bytes())?;
+        if let Self::Gpu { device_id, .. } = self {
+            transport.write_all(&device_id.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn read_from(
+        transport: &mut platform::TransportReceiver,
+        limits: ProtocolLimits,
+    ) -> Result<Self> {
+        let mut kind = [0_u8; 1];
+        transport.read_exact(&mut kind)?;
+        let kind = FrameKind::try_from(kind[0])?;
+
+        let mut buffer_size_bytes = [0_u8; 8];
+        transport.read_exact(&mut buffer_size_bytes)?;
+        let buffer_size = match usize::try_from(u64::from_le_bytes(buffer_size_bytes)) {
+            Ok(buffer_size) => buffer_size,
+            Err(_) => {
+                return Err(channel_protocol_error(
+                    "read_message_envelope",
+                    "buffer size overflow",
+                ));
+            }
+        };
+        limits.validate_inbound_payload_size(buffer_size)?;
+
+        match kind {
+            FrameKind::Cpu => Ok(Self::Cpu { buffer_size }),
+            FrameKind::Gpu => {
+                let mut device_id_bytes = [0_u8; 4];
+                transport.read_exact(&mut device_id_bytes)?;
+                Ok(Self::Gpu {
+                    buffer_size,
+                    device_id: u32::from_le_bytes(device_id_bytes),
+                })
+            }
         }
     }
 }
@@ -268,9 +348,10 @@ impl Sender {
             metadata,
             self.limits,
         )?;
-        let result = envelope
-            .write_to(&mut self.transport)
-            .and_then(|()| self.recv_import_ack());
+        let result = match envelope.write_to(&mut self.transport) {
+            Ok(()) => self.recv_import_ack(),
+            Err(error) => Err(error),
+        };
         match result {
             Ok(()) => {
                 self.transport.complete_transfer();
@@ -294,9 +375,10 @@ impl Sender {
             &metadata,
             self.limits,
         )?;
-        let result = envelope
-            .write_to(&mut self.transport)
-            .and_then(|()| self.recv_import_ack());
+        let result = match envelope.write_to(&mut self.transport) {
+            Ok(()) => self.recv_import_ack(),
+            Err(error) => Err(error),
+        };
         match result {
             Ok(()) => {
                 self.transport.complete_transfer();
@@ -467,7 +549,7 @@ pub(crate) fn is_retryable_connect_error(err: &LavaFlowError) -> bool {
 
 #[derive(Debug)]
 struct MessageEnvelope {
-    size: usize,
+    header: FrameHeader,
     handle: InterprocessMemoryHandle,
     metadata: Vec<u8>,
 }
@@ -480,11 +562,11 @@ impl MessageEnvelope {
         limits: ProtocolLimits,
     ) -> Result<Self> {
         let metadata = Self::encode_metadata(encoding, metadata)?;
-        let (size, handle) = Self::export_frame(frame)?;
-        limits.validate_outbound_payload_size(size)?;
+        let (header, handle) = Self::export_frame(frame)?;
+        limits.validate_outbound_payload_size(header.buffer_size())?;
         limits.validate_outbound_metadata_len(metadata.len())?;
         Ok(Self {
-            size,
+            header,
             handle,
             metadata,
         })
@@ -492,22 +574,26 @@ impl MessageEnvelope {
 
     fn write_to(self, transport: &mut platform::TransportSender) -> Result<()> {
         let Self {
-            size,
+            header,
             handle,
             metadata,
         } = self;
-        let payload_size = size as u64;
-        let metadata_len = u32::try_from(metadata.len()).map_err(|_| {
-            channel_protocol_error("write_message_envelope", "metadata length overflow")
-        })?;
-        let kind = FrameKind::from_handle(&handle);
+        let metadata_len = match u32::try_from(metadata.len()) {
+            Ok(metadata_len) => metadata_len,
+            Err(_) => {
+                return Err(channel_protocol_error(
+                    "write_message_envelope",
+                    "metadata length overflow",
+                ));
+            }
+        };
 
         // TODO: add a generic send_handle() dispatch here once local GPU handle transfer is
         // implemented. That generic entry point should select backend-specific
         // send_cpu_handle()/send_gpu_handle() methods because the rights and transfer mechanics
         // differ by handle kind and platform.
-        transport.write_all(&[ProtocolTag::MessageEnvelope as u8, kind as u8])?;
-        transport.write_all(&payload_size.to_le_bytes())?;
+        transport.write_all(&[ProtocolTag::MessageEnvelope as u8])?;
+        header.write_to(transport)?;
         transport.send_cpu_handle(handle)?;
         transport.write_all(&metadata_len.to_le_bytes())?;
         transport.write_all(&metadata)?;
@@ -526,22 +612,13 @@ impl MessageEnvelope {
             ));
         }
 
-        let mut kind = [0_u8; 1];
-        transport.read_exact(&mut kind)?;
-        let kind = FrameKind::try_from(kind[0])?;
-
-        let mut payload_size_bytes = [0_u8; 8];
-        transport.read_exact(&mut payload_size_bytes)?;
-        let size = usize::try_from(u64::from_le_bytes(payload_size_bytes)).map_err(|_| {
-            channel_protocol_error("read_message_envelope", "payload size overflow")
-        })?;
-        limits.validate_inbound_payload_size(size)?;
+        let header = FrameHeader::read_from(transport, limits)?;
 
         // TODO: add a generic recv_handle() dispatch here once local GPU handle transfer is
         // implemented. The generic path should validate the frame kind tag and then call
         // recv_cpu_handle()/recv_gpu_handle() as appropriate for the transferred handle class.
         let handle = transport.recv_cpu_handle()?;
-        if FrameKind::from_handle(&handle) != kind {
+        if FrameKind::from_handle(&handle) != header.kind() {
             return Err(channel_protocol_error(
                 "read_message_envelope",
                 "frame kind does not match transferred handle",
@@ -556,7 +633,7 @@ impl MessageEnvelope {
         transport.read_exact(&mut metadata)?;
 
         Ok(Self {
-            size,
+            header,
             handle,
             metadata,
         })
@@ -564,12 +641,9 @@ impl MessageEnvelope {
 
     fn decode_metadata<M: Metadata>(&self, encoding: MetadataEncoding) -> Result<M> {
         match encoding {
-            MetadataEncoding::Json => serde_json::from_slice(&self.metadata).map_err(|source| {
-                LavaFlowError::ChannelMetadataCodec {
-                    operation: "deserialize_metadata",
-                    source,
-                }
-            }),
+            MetadataEncoding::Json => {
+                serde_json::from_slice(&self.metadata).map_err(metadata_deserialize_error)
+            }
             MetadataEncoding::Cbor => {
                 Err(LavaFlowError::UnsupportedMetadataEncoding { encoding: "cbor" })
             }
@@ -581,8 +655,10 @@ impl MessageEnvelope {
         // support and the Vulkan IPC path is wired into channels::local.
         match FrameKind::from_handle(&self.handle) {
             FrameKind::Cpu => {
-                let buffer =
-                    cpu::MemoryBuffer::from_shared_handle(self.size, self.handle.try_clone()?)?;
+                let buffer = cpu::MemoryBuffer::from_shared_handle(
+                    self.header.buffer_size(),
+                    self.handle.try_clone()?,
+                )?;
                 Ok(Frame::Cpu(buffer))
             }
             FrameKind::Gpu => Err(LavaFlowError::UnsupportedChannelBufferKind { kind: "gpu" }),
@@ -592,10 +668,7 @@ impl MessageEnvelope {
     fn encode_metadata<M: Metadata>(encoding: MetadataEncoding, metadata: &M) -> Result<Vec<u8>> {
         match encoding {
             MetadataEncoding::Json => {
-                serde_json::to_vec(metadata).map_err(|source| LavaFlowError::ChannelMetadataCodec {
-                    operation: "serialize_metadata",
-                    source,
-                })
+                serde_json::to_vec(metadata).map_err(metadata_serialize_error)
             }
             MetadataEncoding::Cbor => {
                 Err(LavaFlowError::UnsupportedMetadataEncoding { encoding: "cbor" })
@@ -603,14 +676,15 @@ impl MessageEnvelope {
         }
     }
 
-    fn export_frame(frame: Frame) -> Result<(usize, InterprocessMemoryHandle)> {
-        // TODO: export GPU-backed frames here once the generic local transport grows a
-        // send_gpu_handle() path. For now channels::local remains CPU-only at the handle-transfer
-        // layer even though the protocol already reserves a GPU frame-kind tag.
-        match frame {
-            Frame::Cpu(buffer) => Ok((buffer.size(), buffer.shared_handle()?)),
-            Frame::Gpu(_) => Err(LavaFlowError::UnsupportedChannelBufferKind { kind: "gpu" }),
-        }
+    fn export_frame(frame: Frame) -> Result<(FrameHeader, InterprocessMemoryHandle)> {
+        let header = FrameHeader::from_frame(&frame);
+        let handle = match frame {
+            Frame::Cpu(buffer) => buffer.shared_handle()?,
+            Frame::Gpu(_) => {
+                return Err(LavaFlowError::UnsupportedChannelBufferKind { kind: "gpu" });
+            }
+        };
+        Ok((header, handle))
     }
 }
 
@@ -629,6 +703,20 @@ fn channel_protocol_error(operation: &'static str, message: &'static str) -> Lav
     LavaFlowError::ChannelTransportOperation {
         operation,
         source: std::io::Error::new(std::io::ErrorKind::InvalidInput, message),
+    }
+}
+
+fn metadata_deserialize_error(source: serde_json::Error) -> LavaFlowError {
+    LavaFlowError::ChannelMetadataCodec {
+        operation: "deserialize_metadata",
+        source,
+    }
+}
+
+fn metadata_serialize_error(source: serde_json::Error) -> LavaFlowError {
+    LavaFlowError::ChannelMetadataCodec {
+        operation: "serialize_metadata",
+        source,
     }
 }
 
@@ -663,25 +751,12 @@ mod tests {
 
         #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
         pub(in crate::channel::local) struct TestMeta {
-            pub(in crate::channel::local) used_size: usize,
             pub(in crate::channel::local) width: u32,
             pub(in crate::channel::local) height: u32,
         }
 
-        impl Metadata for TestMeta {
-            fn used_size(&self) -> usize {
-                self.used_size
-            }
-        }
-
         #[derive(Clone, Debug, Deserialize)]
         pub(in crate::channel::local) struct FailingMeta;
-
-        impl Metadata for FailingMeta {
-            fn used_size(&self) -> usize {
-                0
-            }
-        }
 
         impl Serialize for FailingMeta {
             fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -693,7 +768,6 @@ mod tests {
         }
 
         pub(in crate::channel::local) const BUFFER_SIZE: usize = 64;
-        pub(in crate::channel::local) const USED_SIZE: usize = 17;
         pub(in crate::channel::local) const TEST_BYTE_OFFSET: usize = 7;
         pub(in crate::channel::local) const TEST_BYTE_VALUE: u8 = 0x5a;
 
@@ -742,8 +816,8 @@ mod tests {
     }
 
     use support::{
-        BUFFER_SIZE, FailingMeta, TEST_BYTE_OFFSET, TEST_BYTE_VALUE, TestMeta, USED_SIZE,
-        test_allocator, test_pair, test_transport_pair,
+        BUFFER_SIZE, FailingMeta, TEST_BYTE_OFFSET, TEST_BYTE_VALUE, TestMeta, test_allocator,
+        test_pair, test_transport_pair,
     };
 
     const SMALL_PAYLOAD_LIMIT: usize = BUFFER_SIZE - 1;
@@ -759,7 +833,6 @@ mod tests {
         buffer.as_mut_slice()[TEST_BYTE_OFFSET] = TEST_BYTE_VALUE;
 
         let metadata = TestMeta {
-            used_size: USED_SIZE,
             width: 1920,
             height: 1080,
         };
@@ -796,10 +869,7 @@ mod tests {
         let mut values = BTreeMap::new();
         values.insert("epoch".to_string(), MetaValue::U64(42));
         values.insert("label".to_string(), MetaValue::String("tile-0".to_string()));
-        let metadata = MessageMeta {
-            used_size: USED_SIZE,
-            values,
-        };
+        let metadata = MessageMeta { values };
         // send_map() also blocks on the receiver-side import ACK, so recv_map() must run concurrently.
         let recv_thread = thread::spawn(move || {
             let (frame, received) = receiver.recv_map().expect("receive dynamic metadata");
@@ -837,7 +907,6 @@ mod tests {
             .allocate(BUFFER_SIZE)
             .expect("allocate payload");
         let metadata = TestMeta {
-            used_size: USED_SIZE,
             width: 16,
             height: 16,
         };
@@ -858,7 +927,6 @@ mod tests {
             .allocate(BUFFER_SIZE)
             .expect("allocate payload");
         let metadata = MessageMeta {
-            used_size: USED_SIZE,
             values: BTreeMap::new(),
         };
 
@@ -875,7 +943,6 @@ mod tests {
             .allocate(BUFFER_SIZE)
             .expect("allocate payload");
         let metadata = TestMeta {
-            used_size: USED_SIZE,
             width: 1,
             height: 1,
         };
@@ -900,7 +967,6 @@ mod tests {
             .allocate(BUFFER_SIZE)
             .expect("allocate gpu payload");
         let metadata = TestMeta {
-            used_size: USED_SIZE,
             width: 16,
             height: 16,
         };
@@ -923,22 +989,6 @@ mod tests {
         let reverse = EndpointAddress::from_channel(&second, Access::CurrentSession);
 
         assert_ne!(forward, reverse);
-    }
-
-    #[test]
-    fn test_meta_used_size_returns_stored_value() {
-        let metadata = TestMeta {
-            used_size: USED_SIZE,
-            width: 1,
-            height: 1,
-        };
-
-        assert_eq!(metadata.used_size(), USED_SIZE);
-    }
-
-    #[test]
-    fn failing_meta_used_size_returns_zero() {
-        assert_eq!(FailingMeta.used_size(), 0);
     }
 
     #[test]
@@ -1195,6 +1245,9 @@ mod tests {
             .write_all(&(BUFFER_SIZE as u64).to_le_bytes())
             .expect("write payload size");
         sender_transport
+            .write_all(&0_u32.to_le_bytes())
+            .expect("write device id");
+        sender_transport
             .send_cpu_handle(handle)
             .expect("send cpu handle");
         sender_transport
@@ -1220,7 +1273,9 @@ mod tests {
             .expect("allocate payload");
         let handle = buffer.shared_handle().expect("export shared handle");
         let envelope = MessageEnvelope {
-            size: BUFFER_SIZE,
+            header: FrameHeader::Cpu {
+                buffer_size: BUFFER_SIZE,
+            },
             handle,
             metadata: b"{".to_vec(),
         };
@@ -1244,7 +1299,9 @@ mod tests {
             .expect("allocate payload");
         let handle = buffer.shared_handle().expect("export shared handle");
         let envelope = MessageEnvelope {
-            size: BUFFER_SIZE,
+            header: FrameHeader::Cpu {
+                buffer_size: BUFFER_SIZE,
+            },
             handle,
             metadata: Vec::new(),
         };
@@ -1283,7 +1340,6 @@ mod tests {
     #[test]
     fn message_envelope_direct_json_encode_decode_supports_typed_and_dynamic_metadata() {
         let typed_metadata = TestMeta {
-            used_size: USED_SIZE,
             width: 320,
             height: 240,
         };
@@ -1295,7 +1351,9 @@ mod tests {
             .shared_handle()
             .expect("export typed shared handle");
         let typed_envelope = MessageEnvelope {
-            size: BUFFER_SIZE,
+            header: FrameHeader::Cpu {
+                buffer_size: BUFFER_SIZE,
+            },
             handle: typed_handle,
             metadata: typed_bytes,
         };
@@ -1305,7 +1363,6 @@ mod tests {
         assert_eq!(decoded_typed, typed_metadata);
 
         let dynamic_metadata = MessageMeta {
-            used_size: USED_SIZE,
             values: BTreeMap::from([("width".into(), MetaValue::F64(320.0))]),
         };
         let dynamic_bytes =
@@ -1317,7 +1374,9 @@ mod tests {
             .shared_handle()
             .expect("export dynamic shared handle");
         let dynamic_envelope = MessageEnvelope {
-            size: BUFFER_SIZE,
+            header: FrameHeader::Cpu {
+                buffer_size: BUFFER_SIZE,
+            },
             handle: dynamic_handle,
             metadata: dynamic_bytes,
         };
@@ -1332,7 +1391,6 @@ mod tests {
         let (mut sender_transport, mut receiver_transport) =
             test_transport_pair().expect("create transport pair");
         let metadata = TestMeta {
-            used_size: USED_SIZE,
             width: 123,
             height: 456,
         };
@@ -1359,11 +1417,35 @@ mod tests {
             .decode_metadata::<TestMeta>(MetadataEncoding::Json)
             .expect("decode written metadata");
         assert_eq!(decoded, metadata);
-        assert_eq!(read_back.size, BUFFER_SIZE);
+        assert_eq!(
+            read_back.header,
+            FrameHeader::Cpu {
+                buffer_size: BUFFER_SIZE
+            }
+        );
         assert!(matches!(
             FrameKind::from_handle(&read_back.handle),
             FrameKind::Cpu
         ));
+    }
+
+    #[test]
+    fn frame_header_gpu_round_trips_device_id() {
+        let (mut sender_transport, mut receiver_transport) =
+            test_transport_pair().expect("create transport pair");
+        let header = FrameHeader::Gpu {
+            buffer_size: BUFFER_SIZE,
+            device_id: 7,
+        };
+
+        header
+            .write_to(&mut sender_transport)
+            .expect("write gpu frame header");
+        sender_transport.flush().expect("flush gpu frame header");
+        let read_back = FrameHeader::read_from(&mut receiver_transport, ProtocolLimits::default())
+            .expect("read gpu frame header");
+
+        assert_eq!(read_back, header);
     }
 
     #[test]
@@ -1373,7 +1455,6 @@ mod tests {
             DEFAULT_MAX_LOCAL_CHANNEL_METADATA_SIZE,
         );
         let metadata = TestMeta {
-            used_size: USED_SIZE,
             width: 1,
             height: 1,
         };
@@ -1406,7 +1487,6 @@ mod tests {
             .allocate(BUFFER_SIZE)
             .expect("allocate payload");
         let metadata = MessageMeta {
-            used_size: USED_SIZE,
             values: BTreeMap::from([(
                 "blob".into(),
                 MetaValue::Bytes(vec![0_u8; SMALL_METADATA_LIMIT + 1]),
@@ -1509,7 +1589,10 @@ mod tests {
             .expect("allocate gpu payload");
         let handle = buffer.shared_handle().expect("export gpu shared handle");
         let envelope = MessageEnvelope {
-            size: BUFFER_SIZE,
+            header: FrameHeader::Gpu {
+                buffer_size: BUFFER_SIZE,
+                device_id: gpu_allocator.device_id(),
+            },
             handle,
             metadata: Vec::new(),
         };
@@ -1538,7 +1621,6 @@ mod tests {
             .expect("allocate payload");
         let handle = buffer.shared_handle().expect("export shared handle");
         let metadata = serde_json::to_vec(&TestMeta {
-            used_size: USED_SIZE,
             width: 8,
             height: 8,
         })
@@ -1589,7 +1671,6 @@ mod tests {
             .expect("allocate payload");
         let handle = buffer.shared_handle().expect("export shared handle");
         let metadata = serde_json::to_vec(&MessageMeta {
-            used_size: USED_SIZE,
             values: BTreeMap::new(),
         })
         .expect("serialize metadata");

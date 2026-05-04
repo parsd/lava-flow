@@ -21,15 +21,15 @@ This document defines the channel API and transport behavior for local and remot
 let channel_id = ChannelId::new("image-stream")?;
 
 // Sender process.
-let tx = Builder::sender(channel_id.clone(), my_loc.clone(), peer_loc.clone())
+let mut tx = Builder::sender(channel_id.clone(), my_loc.clone(), peer_loc.clone())
     .with_metadata_encoding(MetadataEncoding::Json)
     .build()?;
 
 
 let meta = ImageMeta {
-    used_size: payload_bytes,
     width: 1920,
     height: 1080,
+    valid_bytes: payload_bytes,
 };
 
 tx.send(payload_buffer, &meta)?;
@@ -39,14 +39,14 @@ tx.send(payload_buffer, &meta)?;
 let channel_id = ChannelId::new("image-stream")?;
 
 // Receiver process.
-let rx = Builder::receiver(channel_id, my_loc, peer_loc).build()?;
+let mut rx = Builder::receiver(channel_id, my_loc, peer_loc).build()?;
 
 let (frame, meta) = rx.recv::<ImageMeta>()?;
-let used = meta.used_size();
+let valid_bytes = meta.valid_bytes;
 
 // Dynamic fallback variant
 let (frame, map_meta) = rx.recv_map()?;
-let used = map_meta.used_size;
+let valid_bytes = map_meta.values.get("valid_bytes");
 ```
 
 Convenience constructors for the common local-scope case, still used from separate peers.
@@ -87,9 +87,7 @@ pub enum Frame {
     Gpu(gpu::MemoryBuffer),
 }
 
-pub trait Metadata: Serialize + DeserializeOwned {
-    fn used_size(&self) -> usize;
-}
+pub trait Metadata: Serialize + DeserializeOwned {}
 
 pub enum ReceiveRepresentation {
     ExternalShare,
@@ -404,7 +402,6 @@ pub enum MetaValue {
 }
 
 pub struct MessageMeta {
-    pub used_size: usize,
     pub values: MetadataMap,
 }
 ```
@@ -418,8 +415,9 @@ Typed metadata remains serde-driven:
 Metadata contract:
 
 - Metadata is mandatory for every message.
-- `used_size` defines the valid payload region for each message.
-- Receivers must use `used_size` rather than assuming full buffer capacity is filled.
+- Buffer size is carried by the transport frame header and is used for handle import.
+- Applications may include valid-byte counts or other payload interpretation fields in metadata
+  when needed.
 
 ## Semantics (All Transports)
 

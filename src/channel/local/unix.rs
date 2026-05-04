@@ -557,7 +557,7 @@ pub(crate) fn stable_test_runtime_dir_guard(test_name: &str, id: u64) -> TestRun
 #[cfg(test)]
 pub(in crate::channel::local) mod tests {
     use super::super::tests::support::{
-        BUFFER_SIZE, TestMeta, USED_SIZE, test_allocator, test_pair, test_transport_pair,
+        BUFFER_SIZE, TestMeta, test_allocator, test_pair, test_transport_pair,
     };
     use super::super::{ProtocolLimits, ProtocolTag, Receiver};
     use super::*;
@@ -691,7 +691,6 @@ pub(in crate::channel::local) mod tests {
             .allocate(BUFFER_SIZE)
             .expect("allocate payload");
         let metadata = TestMeta {
-            used_size: USED_SIZE,
             width: 32,
             height: 32,
         };
@@ -1355,7 +1354,6 @@ pub(in crate::channel::local) mod tests {
             ProtocolLimits::default(),
         );
         let metadata = serde_json::to_vec(&TestMeta {
-            used_size: USED_SIZE,
             width: 8,
             height: 8,
         })
@@ -1398,7 +1396,6 @@ pub(in crate::channel::local) mod tests {
             ProtocolLimits::default(),
         );
         let metadata = serde_json::to_vec(&crate::channel::MessageMeta {
-            used_size: USED_SIZE,
             values: BTreeMap::new(),
         })
         .expect("serialize metadata");
