@@ -4,7 +4,7 @@ use super::{
 };
 use crate::memory::allocator::InterprocessMemoryHandle;
 use ash::vk;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
 pub(super) const EXTERNAL_MEMORY_HANDLE_TYPE: vk::ExternalMemoryHandleTypeFlags =
     vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD;
@@ -36,10 +36,20 @@ impl ExternalMemoryDevice {
     }
 }
 
+/// Owned Unix Vulkan external-memory file descriptor.
+///
+/// Handles returned by [`crate::memory::gpu::MemoryBuffer::external_handle`] are duplicates owned
+/// by the caller. Vulkan clients can import them with
+/// [`crate::memory::gpu::EXTERNAL_MEMORY_HANDLE_TYPE`] on the same logical GPU device.
 #[derive(Debug)]
-pub(super) struct ExternalHandle(OwnedFd);
+pub struct ExternalHandle(OwnedFd);
 
 impl ExternalHandle {
+    /// Returns a borrowed file descriptor for Vulkan import calls.
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+
     pub(super) fn from_interprocess_handle(handle: InterprocessMemoryHandle) -> Result<Self> {
         match handle {
             InterprocessMemoryHandle::GpuOpaqueFd(fd) => Ok(Self(fd)),
@@ -50,12 +60,44 @@ impl ExternalHandle {
     }
 
     pub(super) fn duplicate_for_ipc(&self) -> Result<InterprocessMemoryHandle> {
-        let duplicated = self
-            .0
+        Ok(InterprocessMemoryHandle::from_gpu_external_fd(
+            self.duplicate_owned()?,
+        ))
+    }
+
+    pub(super) fn try_clone(&self) -> Result<Self> {
+        Ok(Self(self.duplicate_owned()?))
+    }
+
+    fn duplicate_owned(&self) -> Result<OwnedFd> {
+        self.0
             .as_fd()
             .try_clone_to_owned()
-            .map_err(|err| vulkan_operation_error("dup_external_handle", err.to_string()))?;
-        Ok(InterprocessMemoryHandle::from_gpu_external_fd(duplicated))
+            .map_err(|err| vulkan_operation_error("dup_external_handle", err.to_string()))
+    }
+}
+
+impl AsFd for ExternalHandle {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+impl AsRawFd for ExternalHandle {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+impl IntoRawFd for ExternalHandle {
+    fn into_raw_fd(self) -> RawFd {
+        self.0.into_raw_fd()
+    }
+}
+
+impl From<ExternalHandle> for OwnedFd {
+    fn from(handle: ExternalHandle) -> Self {
+        handle.0
     }
 }
 

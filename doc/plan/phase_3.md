@@ -42,6 +42,9 @@ Implemented now:
 - explicit receiver import `ImportOk` / `ImportFailed` ACK/NACK
 - CPU shared-memory handle transfer and import
 - GPU external-memory handle transfer and Vulkan import/export integration
+- public GPU external-memory handle export for Vulkan client interop
+- real child-process local IPC harness for CPU and GPU payload transfer, with GPU tests skipped
+  when Vulkan is unavailable
 - configurable local protocol size limits:
   - payload cap
   - metadata cap
@@ -63,7 +66,6 @@ Not implemented yet:
 
 - remote builder/runtime path
 - receiver-side materialization allocator integration
-- true inter-process CPU and GPU test coverage
 - bootstrap authentication and optional peer-identity validation
 
 ## Phase Ordering
@@ -74,7 +76,7 @@ Implementation has proceeded in this order:
 2. Builder integration around deterministic local endpoint naming derived from `ChannelId`. **Done.**
 3. GPU allocator changes required for device-local, importable external-memory allocations. **Done.**
 4. Local point-to-point GPU external-handle transfer and Vulkan IPC integration. **Done.**
-5. True inter-process tests for CPU and GPU local IPC paths. **Remaining.**
+5. True inter-process tests for CPU and GPU local IPC paths. **Done.**
 6. Local bootstrap hardening. **Remaining.**
    - optional OS peer validation during connection establishment
    - shared-secret HMAC challenge/response before any handle transfer or message I/O
@@ -251,17 +253,21 @@ Rationale:
 
 ## Encapsulation Boundary
 
-`InterprocessMemoryHandle` should remain private in Phase 3 unless a concrete transport or interop integration cannot be
-implemented cleanly without exposing it.
+`InterprocessMemoryHandle` remains private in Phase 3.
 
 Preferred boundary:
 
 - Layer 1 exposes stable allocators and buffers
 - Layer 2 local transports perform handle export/import internally
-- Public channel APIs expose `Frame`, metadata, and allocator configuration rather than raw OS handles
+- Public channel APIs expose `Frame`, metadata, and allocator configuration rather than raw OS
+  handles
+- GPU Vulkan interop uses a public `gpu::ExternalHandle`, exported as an owned
+  duplicate from `gpu::MemoryBuffer::external_handle()`
 
-If later language interop work requires direct handle access, that should be introduced as a narrower public export/import
-API rather than by exposing all transport internals by default.
+This keeps lava-flow's internal `VkBuffer`, `VkDeviceMemory`, and `VkDevice` private. Vulkan users
+or wrapper libraries can import the external-memory handle into their own device abstraction using
+`gpu::EXTERNAL_MEMORY_HANDLE_TYPE` plus buffer metadata such as `size()`, `allocation_size()`, and
+`device_id()`.
 
 ## Deferred Follow-Up
 

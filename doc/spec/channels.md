@@ -379,6 +379,11 @@ fn select_transport(scope: CommunicationScope, frame: &Frame) -> TransportKind {
 For local point-to-point transport bootstrap, the runtime should derive a deterministic endpoint
 name from `ChannelId` rather than requiring users to exchange raw platform addresses.
 
+Vulkan client interop uses GPU external-memory handles rather than lava-flow's internal Vulkan
+objects. `gpu::MemoryBuffer::external_handle()` returns an owned duplicate handle that clients can
+import into their own Vulkan device or wrapper library using `gpu::EXTERNAL_MEMORY_HANDLE_TYPE`.
+`VkBuffer`, `VkDeviceMemory`, and `VkDevice` objects created by lava-flow remain internal.
+
 ## Why No `recv_into` In Core API
 
 - `recv_into` couples channel API to concrete buffer ownership details.

@@ -9,15 +9,27 @@ mod unix;
 mod windows;
 
 #[cfg(unix)]
-use unix::{EXTERNAL_MEMORY_HANDLE_TYPE, ExternalHandle, ExternalMemoryDevice};
+pub use unix::ExternalHandle;
+#[cfg(unix)]
+use unix::{
+    EXTERNAL_MEMORY_HANDLE_TYPE as PLATFORM_EXTERNAL_MEMORY_HANDLE_TYPE, ExternalMemoryDevice,
+};
 #[cfg(windows)]
-use windows::{EXTERNAL_MEMORY_HANDLE_TYPE, ExternalHandle, ExternalMemoryDevice};
+pub use windows::ExternalHandle;
+#[cfg(windows)]
+use windows::{
+    EXTERNAL_MEMORY_HANDLE_TYPE as PLATFORM_EXTERNAL_MEMORY_HANDLE_TYPE, ExternalMemoryDevice,
+};
 
 const ENV_DISABLE_VULKAN: &str = "LAVA_FLOW_DISABLE_VULKAN";
 const DEFAULT_DEVICE_ID: u32 = 0;
 const PKG_VERSION_MAJOR: &str = env!("CARGO_PKG_VERSION_MAJOR");
 const PKG_VERSION_MINOR: &str = env!("CARGO_PKG_VERSION_MINOR");
 const PKG_VERSION_PATCH: &str = env!("CARGO_PKG_VERSION_PATCH");
+
+/// Vulkan external-memory handle type used by exported GPU buffers on this platform.
+pub const EXTERNAL_MEMORY_HANDLE_TYPE: vk::ExternalMemoryHandleTypeFlags =
+    PLATFORM_EXTERNAL_MEMORY_HANDLE_TYPE;
 
 /// GPU-backed memory buffer metadata and storage.
 #[derive(Debug)]
@@ -95,6 +107,11 @@ impl MemoryBuffer {
     /// Returns the device identifier used for allocation.
     pub fn device_id(&self) -> u32 {
         self.context.device_id
+    }
+
+    /// Exports a duplicate Vulkan external-memory handle for client-side Vulkan interop.
+    pub fn external_handle(&self) -> Result<ExternalHandle> {
+        self.external_handle.try_clone()
     }
 
     /// Returns the exportable external handle.
@@ -191,8 +208,6 @@ impl Allocator {
 
 struct DeviceContext {
     _runtime: Arc<VulkanRuntime>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    queue_family_index: u32,
     device_id: u32,
     device: ash::Device,
     external_memory_device: ExternalMemoryDevice,
@@ -234,7 +249,6 @@ impl DeviceContext {
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
         Ok(Self {
             _runtime: runtime,
-            queue_family_index,
             device_id,
             device,
             external_memory_device,
@@ -691,6 +705,16 @@ mod tests {
 
         pub(super) fn set_fail_point(fail_point: FailPoint) {
             FAIL_POINT.with(|slot| slot.set(Some(fail_point)));
+        }
+
+        pub(super) fn queue_family_index_for_context(context: &DeviceContext) -> u32 {
+            let physical_device = context
+                ._runtime
+                .get_physical_device(context.device_id)
+                .expect("context physical device");
+            RealVulkanApi
+                .find_queue_family_index(&context._runtime.instance, physical_device)
+                .expect("context queue family")
         }
 
         fn should_fail(fail_point: FailPoint) -> bool {
@@ -1164,13 +1188,12 @@ mod tests {
                 .allocate(BUFFER_SIZE)
                 .expect("allocate destination gpu buffer");
             let context = &allocator.context;
+            let queue_family_index = support::queue_family_index_for_context(context);
             unsafe {
-                let queue = context
-                    .device
-                    .get_device_queue(context.queue_family_index, 0);
+                let queue = context.device.get_device_queue(queue_family_index, 0);
 
-                let pool_info = vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(context.queue_family_index);
+                let pool_info =
+                    vk::CommandPoolCreateInfo::default().queue_family_index(queue_family_index);
                 let command_pool = context
                     .device
                     .create_command_pool(&pool_info, None)

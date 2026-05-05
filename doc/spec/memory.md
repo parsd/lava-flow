@@ -54,6 +54,7 @@ Implemented backend abstraction:
   - `allocation_size()` (Vulkan-required backing bytes)
   - external-handle metadata
   - internal external-handle import/export for channel transports
+  - public duplicate external-handle export for Vulkan client interop
 - GPU allocator construction fails when backend is unavailable/disabled
 - GPU allocation path does not expose host-mapped pointer access in the public API
 
@@ -112,6 +113,16 @@ Handle import behavior:
 
 - GPU buffer: imports GPU external handles into a Vulkan buffer on the selected logical device
 - CPU buffer: imports CPU shared-memory transport handles
+
+Public handle boundary:
+
+- `InterprocessMemoryHandle` remains internal to channel and allocator plumbing.
+- `gpu::MemoryBuffer::external_handle()` exposes an owned duplicate GPU external-memory handle for
+  Vulkan client interop.
+- Clients import that handle using `gpu::EXTERNAL_MEMORY_HANDLE_TYPE` together with the buffer's
+  `size()`, `allocation_size()`, and `device_id()`.
+- Internal `VkBuffer`, `VkDeviceMemory`, and `VkDevice` objects remain private because they are only
+  valid with lava-flow's internal Vulkan device and lifetime model.
 
 ## Platform Implementation Layout
 

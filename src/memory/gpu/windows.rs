@@ -4,7 +4,9 @@ use super::{
 };
 use crate::memory::allocator::InterprocessMemoryHandle;
 use ash::vk;
-use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{
+    AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle,
+};
 
 pub(super) const EXTERNAL_MEMORY_HANDLE_TYPE: vk::ExternalMemoryHandleTypeFlags =
     vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32;
@@ -39,10 +41,20 @@ impl ExternalMemoryDevice {
     }
 }
 
+/// Owned Windows Vulkan external-memory handle.
+///
+/// Handles returned by [`crate::memory::gpu::MemoryBuffer::external_handle`] are duplicates owned
+/// by the caller. Vulkan clients can import them with
+/// [`crate::memory::gpu::EXTERNAL_MEMORY_HANDLE_TYPE`] on the same logical GPU device.
 #[derive(Debug)]
-pub(super) struct ExternalHandle(OwnedHandle);
+pub struct ExternalHandle(OwnedHandle);
 
 impl ExternalHandle {
+    /// Returns a borrowed Win32 handle for Vulkan import calls.
+    pub fn as_handle(&self) -> BorrowedHandle<'_> {
+        self.0.as_handle()
+    }
+
     pub(super) fn from_interprocess_handle(handle: InterprocessMemoryHandle) -> Result<Self> {
         match handle {
             InterprocessMemoryHandle::GpuOpaqueWin32Handle(handle) => Ok(Self(handle)),
@@ -53,14 +65,44 @@ impl ExternalHandle {
     }
 
     pub(super) fn duplicate_for_ipc(&self) -> Result<InterprocessMemoryHandle> {
-        let duplicated = self
-            .0
+        Ok(InterprocessMemoryHandle::from_gpu_external_handle(
+            self.duplicate_owned()?,
+        ))
+    }
+
+    pub(super) fn try_clone(&self) -> Result<Self> {
+        Ok(Self(self.duplicate_owned()?))
+    }
+
+    fn duplicate_owned(&self) -> Result<OwnedHandle> {
+        self.0
             .as_handle()
             .try_clone_to_owned()
-            .map_err(|err| vulkan_operation_error("dup_external_handle", err.to_string()))?;
-        Ok(InterprocessMemoryHandle::from_gpu_external_handle(
-            duplicated,
-        ))
+            .map_err(|err| vulkan_operation_error("dup_external_handle", err.to_string()))
+    }
+}
+
+impl AsHandle for ExternalHandle {
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        self.0.as_handle()
+    }
+}
+
+impl AsRawHandle for ExternalHandle {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.0.as_raw_handle()
+    }
+}
+
+impl IntoRawHandle for ExternalHandle {
+    fn into_raw_handle(self) -> RawHandle {
+        self.0.into_raw_handle()
+    }
+}
+
+impl From<ExternalHandle> for OwnedHandle {
+    fn from(handle: ExternalHandle) -> Self {
+        handle.0
     }
 }
 
