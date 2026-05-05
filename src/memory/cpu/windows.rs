@@ -12,7 +12,6 @@ trait Syscalls: Sync {
         bytes: usize,
     ) -> Result<MEMORY_MAPPED_VIEW_ADDRESS>;
     fn unmap_view_of_file(&self, view: MEMORY_MAPPED_VIEW_ADDRESS);
-    #[cfg_attr(not(test), allow(dead_code))]
     fn duplicate_handle_same_access(&self, source: RawHandle) -> Result<OwnedHandle>;
 }
 
@@ -26,7 +25,6 @@ static SYSCALLS: tests::support::MockSyscalls = tests::support::MockSyscalls;
 pub(super) struct SharedMemoryRegion {
     ptr: *mut u8,
     len: usize,
-    #[cfg_attr(not(test), allow(dead_code))]
     mapping: std::os::windows::io::OwnedHandle,
 }
 
@@ -46,7 +44,6 @@ impl SharedMemoryRegion {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn from_handle(
         size: usize,
         max_allocation_size: usize,
@@ -84,7 +81,6 @@ impl SharedMemoryRegion {
         self.len
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn export_handle(&self) -> Result<InterprocessMemoryHandle> {
         use std::os::windows::io::AsRawHandle;
         let duplicated = SYSCALLS.duplicate_handle_same_access(self.mapping.as_raw_handle())?;

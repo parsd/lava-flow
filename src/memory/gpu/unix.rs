@@ -126,7 +126,9 @@ mod tests {
                 .export_memory_handle(buffer.memory)
                 .expect("export external handle");
             let handle = external.duplicate_for_ipc().expect("duplicate for ipc");
-            assert!(matches!(handle, InterprocessMemoryHandle::GpuOpaqueFd(_)));
+            assert!(crate::memory::allocator::tests::support::handle_is_gpu(
+                &handle
+            ));
         }
     }
 
@@ -148,9 +150,8 @@ mod tests {
             assert_eq!(imported.size(), BUFFER_SIZE);
             assert!(imported.allocation_size() >= BUFFER_SIZE as u64);
             let reexported = imported.shared_handle().expect("re-export imported handle");
-            assert!(matches!(
-                reexported,
-                InterprocessMemoryHandle::GpuOpaqueFd(_)
+            assert!(crate::memory::allocator::tests::support::handle_is_gpu(
+                &reexported
             ));
         }
     }

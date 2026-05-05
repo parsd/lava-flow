@@ -197,6 +197,7 @@ Per-message flow:
 - sender writes a message-envelope tag
 - sender writes the payload backend kind tag derived from the transferred handle
 - sender writes payload size
+- for GPU payloads, sender writes the logical GPU device id used for receive-side import
 - sender transfers the shared-memory handle
 - sender writes serialized metadata bytes
 - receiver imports the handle and then sends either:
@@ -248,7 +249,8 @@ Phase 3 local security is transport-specific and currently implemented as follow
 
 Windows:
 
-- local CPU IPC uses one duplex named pipe for bootstrap, envelopes, and import ACK/NACK traffic
+- local IPC uses one duplex named pipe for bootstrap, envelopes, CPU/GPU handle transfer, and
+  import ACK/NACK traffic
 - the named pipe is created with an explicit DACL rather than the Windows default
 - the default current-session local access policy grants access to the current logon session only
 - the authenticated-users local access policy grants access to the Windows Authenticated Users SID;
@@ -257,7 +259,7 @@ Windows:
 
 Unix:
 
-- local CPU IPC uses Unix-domain sockets with `SCM_RIGHTS` for fd transfer
+- local IPC uses Unix-domain sockets with `SCM_RIGHTS` for CPU/GPU fd transfer
 - the default current-session local access policy derives the socket path under a private per-user
   runtime directory
 - `LAVA_FLOW_RUNTIME_DIR` is preferred as an explicit override for orchestrated/container setups

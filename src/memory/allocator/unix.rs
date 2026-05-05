@@ -7,7 +7,6 @@ impl InterprocessMemoryHandle {
         Self::GpuOpaqueFd(fd)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_cpu_shared_fd(fd: OwnedFd) -> Self {
         Self::CpuSharedFd(fd)
     }
@@ -40,9 +39,21 @@ impl InterprocessMemoryHandle {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
+
+    pub(crate) mod support {
+        use crate::memory::allocator::InterprocessMemoryHandle;
+
+        pub(crate) fn handle_is_cpu(handle: &InterprocessMemoryHandle) -> bool {
+            matches!(handle, InterprocessMemoryHandle::CpuSharedFd(_))
+        }
+
+        pub(crate) fn handle_is_gpu(handle: &InterprocessMemoryHandle) -> bool {
+            matches!(handle, InterprocessMemoryHandle::GpuOpaqueFd(_))
+        }
+    }
 
     #[test]
     fn from_gpu_external_fd_reports_valid_fd() {
@@ -53,7 +64,7 @@ mod tests {
         let owned = unsafe { OwnedFd::from_raw_fd(fds[1]) };
         let handle = InterprocessMemoryHandle::from_gpu_external_fd(owned);
         assert!(handle.is_valid());
-        assert!(matches!(handle, InterprocessMemoryHandle::GpuOpaqueFd(_)));
+        assert!(support::handle_is_gpu(&handle));
     }
 
     #[test]
@@ -65,6 +76,6 @@ mod tests {
         let owned = unsafe { OwnedFd::from_raw_fd(fds[1]) };
         let handle = InterprocessMemoryHandle::from_cpu_shared_fd(owned);
         assert!(handle.is_valid());
-        assert!(matches!(handle, InterprocessMemoryHandle::CpuSharedFd(_)));
+        assert!(support::handle_is_cpu(&handle));
     }
 }

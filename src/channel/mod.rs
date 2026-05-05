@@ -806,6 +806,53 @@ mod tests {
     }
 
     #[test]
+    fn local_builder_public_gpu_send_and_recv_round_trip() {
+        let allocator = match gpu::Allocator::new() {
+            Ok(allocator) => allocator,
+            Err(_) => return,
+        };
+        let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let _runtime_guard = local::stable_test_runtime_dir_guard("public-gpu", id);
+        let channel_id =
+            ChannelId::new(format!("builder-local-gpu-round-trip-{id}")).expect("channel id");
+        let receiver_channel_id = channel_id.clone();
+        let expected = PublicTestMeta {
+            width: 320,
+            height: 240,
+        };
+        let receiver_thread = thread::spawn(move || {
+            let mut receiver = build_local_receiver_with_timeout(receiver_channel_id, 0);
+            let (frame, metadata) = receiver
+                .recv::<PublicTestMeta>()
+                .expect("receive gpu typed message");
+            let Frame::Gpu(buffer) = frame else {
+                panic!("expected gpu frame");
+            };
+            (metadata, buffer.size(), buffer.device_id())
+        });
+
+        let mut sender = Builder::sender(
+            channel_id,
+            ProcessLocation::new("node-0").expect("sender location"),
+            ProcessLocation::new("node-0").expect("receiver location"),
+        )
+        .with_metadata_encoding(MetadataEncoding::Json)
+        .build()
+        .expect("build sender");
+        let buffer = allocator.allocate(64).expect("allocate gpu payload");
+        sender
+            .send(buffer, &expected)
+            .expect("send gpu typed message");
+
+        let (received, size, device_id) = receiver_thread
+            .join()
+            .expect("receiver thread must not panic");
+        assert_eq!(received, expected);
+        assert_eq!(size, 64);
+        assert_eq!(device_id, allocator.device_id());
+    }
+
+    #[test]
     fn local_builder_sender_limit_override_rejects_oversized_payload() {
         let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let _runtime_guard = local::stable_test_runtime_dir_guard("limits", id);

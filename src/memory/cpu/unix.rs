@@ -6,7 +6,6 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
 
-#[cfg_attr(not(test), allow(dead_code))]
 trait Syscalls: Sync {
     fn shm_open(&self, name: &CString) -> Result<OwnedFd>;
     fn shm_unlink(&self, name: &CString) -> Result<()>;
@@ -83,7 +82,6 @@ static SYSCALLS: RealSyscalls = RealSyscalls;
 pub(super) struct SharedMemoryRegion {
     ptr: *mut u8,
     len: usize,
-    #[cfg_attr(not(test), allow(dead_code))]
     fd: std::os::fd::OwnedFd,
 }
 
@@ -106,7 +104,6 @@ impl SharedMemoryRegion {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn from_handle(
         size: usize,
         max_allocation_size: usize,
@@ -143,7 +140,6 @@ impl SharedMemoryRegion {
         self.len
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn export_handle(&self) -> Result<InterprocessMemoryHandle> {
         let owned_fd = SYSCALLS.dup_fd_cloexec(self.fd.as_raw_fd())?;
         Ok(InterprocessMemoryHandle::from_cpu_shared_fd(owned_fd))

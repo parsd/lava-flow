@@ -27,13 +27,11 @@ pub struct MemoryBuffer {
     allocation_size: u64,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
-    #[cfg_attr(not(any(test, windows)), allow(dead_code))]
     external_handle: ExternalHandle,
 }
 
 impl MemoryBuffer {
     /// Imports a GPU external-memory handle into a Vulkan buffer on `device_id`.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_shared_handle(
         device_id: u32,
         size: usize,
@@ -100,7 +98,6 @@ impl MemoryBuffer {
     }
 
     /// Returns the exportable external handle.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn shared_handle(&self) -> Result<InterprocessMemoryHandle> {
         self.external_handle.duplicate_for_ipc()
     }
@@ -1108,12 +1105,8 @@ mod tests {
             assert!(buffer.allocation_size() >= BUFFER_SIZE as u64);
             assert_eq!(buffer.device_id(), allocator.device_id());
             let handle = buffer.shared_handle().expect("export handle");
-            #[cfg(unix)]
-            assert!(matches!(handle, InterprocessMemoryHandle::GpuOpaqueFd(_)));
-            #[cfg(windows)]
-            assert!(matches!(
-                handle,
-                InterprocessMemoryHandle::GpuOpaqueWin32Handle(_)
+            assert!(crate::memory::allocator::tests::support::handle_is_gpu(
+                &handle
             ));
         });
     }

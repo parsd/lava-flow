@@ -1,7 +1,7 @@
 use super::{BuildCancel, Frame, MessageMeta, Metadata, MetadataEncoding};
 use crate::error::{LavaFlowError, Result};
 use crate::memory::allocator::InterprocessMemoryHandle;
-use crate::memory::cpu;
+use crate::memory::{cpu, gpu};
 use crate::types::ChannelId;
 use std::convert::TryFrom;
 use std::thread;
@@ -299,10 +299,10 @@ impl FrameHeader {
     }
 }
 
-/// Sender half of the local CPU IPC transport.
+/// Sender half of the local IPC transport.
 ///
 /// This transport uses an OS-native local IPC primitive to transfer the control envelope while the
-/// payload bytes stay in shared memory and are referenced through an exported CPU handle.
+/// payload bytes stay in shared memory and are referenced through an exported CPU or GPU handle.
 #[derive(Debug)]
 pub(crate) struct Sender {
     encoding: MetadataEncoding,
@@ -336,7 +336,7 @@ impl Sender {
         })
     }
 
-    /// Sends a payload frame with typed metadata through local CPU IPC.
+    /// Sends a payload frame with typed metadata through local IPC.
     pub(crate) fn send<F, M>(&mut self, frame: F, metadata: &M) -> Result<()>
     where
         F: Into<Frame>,
@@ -364,7 +364,7 @@ impl Sender {
         }
     }
 
-    /// Sends a payload frame with dynamic metadata through local CPU IPC.
+    /// Sends a payload frame with dynamic metadata through local IPC.
     pub(crate) fn send_map<F>(&mut self, frame: F, metadata: MessageMeta) -> Result<()>
     where
         F: Into<Frame>,
@@ -462,7 +462,7 @@ impl SenderListener {
     }
 }
 
-/// Receiver half of the local CPU IPC transport.
+/// Receiver half of the local IPC transport.
 #[derive(Debug)]
 pub(crate) struct Receiver {
     encoding: MetadataEncoding,
@@ -489,7 +489,7 @@ impl Receiver {
         Ok(Self::new(header.encoding, transport, limits))
     }
 
-    /// Receives a payload frame with typed metadata through local CPU IPC.
+    /// Receives a payload frame with typed metadata through local IPC.
     pub(crate) fn recv<M: Metadata>(&mut self) -> Result<(Frame, M)> {
         let message = MessageEnvelope::read_from(&mut self.transport, self.limits)?;
         let frame = match message.try_into_frame() {
@@ -506,7 +506,7 @@ impl Receiver {
         Ok((frame, metadata))
     }
 
-    /// Receives a payload frame with dynamic metadata through local CPU IPC.
+    /// Receives a payload frame with dynamic metadata through local IPC.
     pub(crate) fn recv_map(&mut self) -> Result<(Frame, MessageMeta)> {
         let message = MessageEnvelope::read_from(&mut self.transport, self.limits)?;
         let frame = match message.try_into_frame() {
@@ -588,13 +588,9 @@ impl MessageEnvelope {
             }
         };
 
-        // TODO: add a generic send_handle() dispatch here once local GPU handle transfer is
-        // implemented. That generic entry point should select backend-specific
-        // send_cpu_handle()/send_gpu_handle() methods because the rights and transfer mechanics
-        // differ by handle kind and platform.
         transport.write_all(&[ProtocolTag::MessageEnvelope as u8])?;
         header.write_to(transport)?;
-        transport.send_cpu_handle(handle)?;
+        transport.send_handle(handle)?;
         transport.write_all(&metadata_len.to_le_bytes())?;
         transport.write_all(&metadata)?;
         transport.flush()
@@ -614,16 +610,9 @@ impl MessageEnvelope {
 
         let header = FrameHeader::read_from(transport, limits)?;
 
-        // TODO: add a generic recv_handle() dispatch here once local GPU handle transfer is
-        // implemented. The generic path should validate the frame kind tag and then call
-        // recv_cpu_handle()/recv_gpu_handle() as appropriate for the transferred handle class.
-        let handle = transport.recv_cpu_handle()?;
-        if FrameKind::from_handle(&handle) != header.kind() {
-            return Err(channel_protocol_error(
-                "read_message_envelope",
-                "frame kind does not match transferred handle",
-            ));
-        }
+        // Local OS handles/fds do not carry the memory backend type. The protocol header is the
+        // typed part of the transfer, and the platform layer wraps the raw handle accordingly.
+        let handle = transport.recv_handle(header.kind())?;
 
         let mut metadata_len_bytes = [0_u8; 4];
         transport.read_exact(&mut metadata_len_bytes)?;
@@ -651,17 +640,23 @@ impl MessageEnvelope {
     }
 
     fn try_into_frame(&self) -> Result<Frame> {
-        // TODO: import GPU-backed frames here once the local transport grows recv_gpu_handle()
-        // support and the Vulkan IPC path is wired into channels::local.
-        match FrameKind::from_handle(&self.handle) {
-            FrameKind::Cpu => {
-                let buffer = cpu::MemoryBuffer::from_shared_handle(
-                    self.header.buffer_size(),
-                    self.handle.try_clone()?,
-                )?;
+        match self.header {
+            FrameHeader::Cpu { buffer_size } => {
+                let buffer =
+                    cpu::MemoryBuffer::from_shared_handle(buffer_size, self.handle.try_clone()?)?;
                 Ok(Frame::Cpu(buffer))
             }
-            FrameKind::Gpu => Err(LavaFlowError::UnsupportedChannelBufferKind { kind: "gpu" }),
+            FrameHeader::Gpu {
+                buffer_size,
+                device_id,
+            } => {
+                let buffer = gpu::MemoryBuffer::from_shared_handle(
+                    device_id,
+                    buffer_size,
+                    self.handle.try_clone()?,
+                )?;
+                Ok(Frame::Gpu(buffer))
+            }
         }
     }
 
@@ -680,9 +675,7 @@ impl MessageEnvelope {
         let header = FrameHeader::from_frame(&frame);
         let handle = match frame {
             Frame::Cpu(buffer) => buffer.shared_handle()?,
-            Frame::Gpu(_) => {
-                return Err(LavaFlowError::UnsupportedChannelBufferKind { kind: "gpu" });
-            }
+            Frame::Gpu(buffer) => buffer.shared_handle()?,
         };
         Ok((header, handle))
     }
@@ -957,8 +950,9 @@ mod tests {
     }
 
     #[test]
-    fn gpu_frames_are_not_supported_by_cpu_local_ipc() {
-        let (mut sender, _) = test_pair(MetadataEncoding::Json).expect("create cpu local ipc pair");
+    fn gpu_local_ipc_round_trips_typed_metadata_and_external_handle() {
+        let (mut sender, mut receiver) =
+            test_pair(MetadataEncoding::Json).expect("create local ipc pair");
         let gpu_allocator = match crate::memory::gpu::Allocator::new() {
             Ok(allocator) => allocator,
             Err(_) => return,
@@ -971,13 +965,24 @@ mod tests {
             height: 16,
         };
 
-        let err = sender
+        // send() waits for the receiver-side import ACK, so recv() must run concurrently.
+        let recv_thread = thread::spawn(move || {
+            let (frame, received) = receiver.recv::<TestMeta>().expect("receive gpu frame");
+            let Frame::Gpu(imported) = frame else {
+                panic!("expected gpu frame");
+            };
+            (received, imported.size(), imported.device_id())
+        });
+
+        sender
             .send(Frame::Gpu(buffer), &metadata)
-            .expect_err("cpu local ipc should reject gpu frames");
-        assert!(matches!(
-            err,
-            LavaFlowError::UnsupportedChannelBufferKind { kind: "gpu" }
-        ));
+            .expect("send gpu frame");
+
+        let (received, imported_size, imported_device_id) =
+            recv_thread.join().expect("receiver thread must not panic");
+        assert_eq!(received, metadata);
+        assert_eq!(imported_size, BUFFER_SIZE);
+        assert_eq!(imported_device_id, gpu_allocator.device_id());
     }
 
     #[test]
@@ -1230,43 +1235,6 @@ mod tests {
     }
 
     #[test]
-    fn receiver_rejects_frame_kind_that_does_not_match_transferred_handle() {
-        let (mut sender_transport, mut receiver_transport) =
-            test_transport_pair().expect("create transport pair");
-        let buffer = test_allocator()
-            .allocate(BUFFER_SIZE)
-            .expect("allocate payload");
-        let handle = buffer.shared_handle().expect("export shared handle");
-
-        sender_transport
-            .write_all(&[ProtocolTag::MessageEnvelope as u8, FrameKind::Gpu as u8])
-            .expect("write message tag and mismatched frame kind");
-        sender_transport
-            .write_all(&(BUFFER_SIZE as u64).to_le_bytes())
-            .expect("write payload size");
-        sender_transport
-            .write_all(&0_u32.to_le_bytes())
-            .expect("write device id");
-        sender_transport
-            .send_cpu_handle(handle)
-            .expect("send cpu handle");
-        sender_transport
-            .write_all(&0_u32.to_le_bytes())
-            .expect("write metadata length");
-        sender_transport.flush().expect("flush mismatched message");
-
-        let err = MessageEnvelope::read_from(&mut receiver_transport, ProtocolLimits::default())
-            .expect_err("receiver must reject frame kind / handle mismatch");
-        assert!(matches!(
-            err,
-            LavaFlowError::ChannelTransportOperation {
-                operation: "read_message_envelope",
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn message_envelope_reports_json_metadata_decode_errors() {
         let buffer = test_allocator()
             .allocate(BUFFER_SIZE)
@@ -1423,9 +1391,8 @@ mod tests {
                 buffer_size: BUFFER_SIZE
             }
         );
-        assert!(matches!(
-            FrameKind::from_handle(&read_back.handle),
-            FrameKind::Cpu
+        assert!(crate::memory::allocator::tests::support::handle_is_cpu(
+            &read_back.handle
         ));
     }
 
@@ -1558,7 +1525,7 @@ mod tests {
             .write_all(&(BUFFER_SIZE as u64).to_le_bytes())
             .expect("write payload size");
         sender_transport
-            .send_cpu_handle(handle)
+            .send_handle(handle)
             .expect("send cpu handle");
         sender_transport
             .write_all(&((SMALL_METADATA_LIMIT + 1) as u32).to_le_bytes())
@@ -1579,7 +1546,7 @@ mod tests {
     }
 
     #[test]
-    fn message_envelope_rejects_gpu_handle_frame_import_in_cpu_transport() {
+    fn message_envelope_imports_gpu_handle_frame() {
         let gpu_allocator = match crate::memory::gpu::Allocator::new() {
             Ok(allocator) => allocator,
             Err(_) => return,
@@ -1597,13 +1564,14 @@ mod tests {
             metadata: Vec::new(),
         };
 
-        let err = envelope
+        let frame = envelope
             .try_into_frame()
-            .expect_err("cpu local transport must reject gpu handle import");
-        assert!(matches!(
-            err,
-            LavaFlowError::UnsupportedChannelBufferKind { kind: "gpu" }
-        ));
+            .expect("gpu frame import must succeed");
+        let Frame::Gpu(imported) = frame else {
+            panic!("expected gpu frame");
+        };
+        assert_eq!(imported.size(), BUFFER_SIZE);
+        assert_eq!(imported.device_id(), gpu_allocator.device_id());
     }
 
     #[cfg(windows)]
@@ -1633,7 +1601,7 @@ mod tests {
             .write_all(&(BUFFER_SIZE as u64).to_le_bytes())
             .expect("write payload size");
         sender_transport
-            .send_cpu_handle(handle)
+            .send_handle(handle)
             .expect("send cpu handle");
         // Close the transferred handle before the receiver imports it so recv() exercises the
         // ImportFailed path instead of failing earlier at envelope parsing time.
@@ -1682,7 +1650,7 @@ mod tests {
             .write_all(&(BUFFER_SIZE as u64).to_le_bytes())
             .expect("write payload size");
         sender_transport
-            .send_cpu_handle(handle)
+            .send_handle(handle)
             .expect("send cpu handle");
         sender_transport.abort_transfer();
         sender_transport

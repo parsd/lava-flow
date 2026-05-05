@@ -43,15 +43,6 @@ impl EndpointAddress {
     }
 }
 
-impl FrameKind {
-    pub(super) fn from_handle(handle: &InterprocessMemoryHandle) -> Self {
-        match handle {
-            InterprocessMemoryHandle::GpuOpaqueWin32Handle(_) => Self::Gpu,
-            InterprocessMemoryHandle::CpuSharedWin32Handle(_) => Self::Cpu,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PipeAccessMask(u32);
 
@@ -258,29 +249,29 @@ impl TransportSender {
         }
     }
 
-    pub(super) fn send_cpu_handle(&mut self, handle: InterprocessMemoryHandle) -> Result<()> {
+    pub(super) fn send_handle(&mut self, handle: InterprocessMemoryHandle) -> Result<()> {
+        let memory_handle = match &handle {
+            InterprocessMemoryHandle::CpuSharedWin32Handle(handle)
+            | InterprocessMemoryHandle::GpuOpaqueWin32Handle(handle) => handle.as_raw_handle(),
+        };
+
+        self.send_remote_handle("send_handle", memory_handle)
+    }
+
+    fn send_remote_handle(
+        &mut self,
+        operation: &'static str,
+        memory_handle: RawHandle,
+    ) -> Result<()> {
         if self.pending_remote_handle.is_some() {
             return Err(channel_protocol_error(
-                "send_cpu_handle",
-                "overlapping pending cpu handle transfer",
+                operation,
+                "overlapping pending handle transfer",
             ));
         }
 
-        let memory_handle = match handle {
-            InterprocessMemoryHandle::CpuSharedWin32Handle(handle) => handle,
-            InterprocessMemoryHandle::GpuOpaqueWin32Handle(_) => {
-                return Err(channel_protocol_error(
-                    "send_cpu_handle",
-                    "unexpected gpu handle for cpu ipc",
-                ));
-            }
-        };
-
         let duplicated = SYSCALLS
-            .duplicate_handle_to_process(
-                memory_handle.as_raw_handle(),
-                self.peer_process.as_raw_handle(),
-            )
+            .duplicate_handle_to_process(memory_handle, self.peer_process.as_raw_handle())
             .map_err(|source| channel_transport_error("DuplicateHandle", source))?;
         let raw_value = duplicated as usize as u64;
         #[cfg(test)]
@@ -433,29 +424,30 @@ impl TransportReceiver {
         }
     }
 
-    pub(super) fn recv_cpu_handle(&mut self) -> Result<InterprocessMemoryHandle> {
+    pub(super) fn recv_handle(&mut self, kind: FrameKind) -> Result<InterprocessMemoryHandle> {
+        let handle = self.recv_raw_handle("recv_handle")?;
+        match kind {
+            FrameKind::Cpu => Ok(InterprocessMemoryHandle::from_cpu_shared_handle(handle)),
+            FrameKind::Gpu => Ok(InterprocessMemoryHandle::from_gpu_external_handle(handle)),
+        }
+    }
+
+    fn recv_raw_handle(&mut self, operation: &'static str) -> Result<OwnedHandle> {
         let mut raw_bytes = [0_u8; 8];
         self.read_exact(&mut raw_bytes)?;
         let raw_value = u64::from_le_bytes(raw_bytes);
         let raw_usize = match usize::try_from(raw_value) {
             Ok(value) => value,
             Err(_) => {
-                return Err(channel_protocol_error(
-                    "recv_cpu_handle",
-                    "handle value overflow",
-                ));
+                return Err(channel_protocol_error(operation, "handle value overflow"));
             }
         };
         let raw = raw_usize as RawHandle;
         if raw.is_null() || raw as isize == -1 {
-            return Err(channel_protocol_error(
-                "recv_cpu_handle",
-                "received invalid handle",
-            ));
+            return Err(channel_protocol_error(operation, "received invalid handle"));
         }
 
-        let owned = unsafe { OwnedHandle::from_raw_handle(raw) };
-        Ok(InterprocessMemoryHandle::from_cpu_shared_handle(owned))
+        Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
     }
 }
 
@@ -1522,7 +1514,7 @@ pub(in crate::channel::local) mod tests {
     }
 
     #[test]
-    fn send_cpu_handle_rejects_overlapping_pending_transfer() {
+    fn send_handle_rejects_overlapping_pending_transfer() {
         let (mut sender, _receiver) = test_transport_pair().expect("create transport pair");
         let first = test_allocator()
             .allocate(BUFFER_SIZE)
@@ -1532,15 +1524,15 @@ pub(in crate::channel::local) mod tests {
             .expect("allocate second payload");
 
         sender
-            .send_cpu_handle(first.shared_handle().expect("export first shared handle"))
+            .send_handle(first.shared_handle().expect("export first shared handle"))
             .expect("start first handle transfer");
         let err = sender
-            .send_cpu_handle(second.shared_handle().expect("export second shared handle"))
+            .send_handle(second.shared_handle().expect("export second shared handle"))
             .expect_err("second transfer must be rejected while one is pending");
         assert!(matches!(
             err,
             LavaFlowError::ChannelTransportOperation {
-                operation: "send_cpu_handle",
+                operation: "send_handle",
                 ..
             }
         ));
@@ -1549,30 +1541,7 @@ pub(in crate::channel::local) mod tests {
     }
 
     #[test]
-    fn send_cpu_handle_rejects_gpu_handle_for_cpu_ipc() {
-        let (mut sender, _receiver) = test_transport_pair().expect("create transport pair");
-        let gpu_allocator = match crate::memory::gpu::Allocator::new() {
-            Ok(allocator) => allocator,
-            Err(_) => return,
-        };
-        let buffer = gpu_allocator
-            .allocate(BUFFER_SIZE)
-            .expect("allocate gpu payload");
-
-        let err = sender
-            .send_cpu_handle(buffer.shared_handle().expect("export gpu handle"))
-            .expect_err("gpu handle must be rejected on cpu ipc transport");
-        assert!(matches!(
-            err,
-            LavaFlowError::ChannelTransportOperation {
-                operation: "send_cpu_handle",
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn recv_cpu_handle_rejects_invalid_handle_value() {
+    fn recv_handle_rejects_invalid_handle_value() {
         let (mut sender, mut receiver) = test_transport_pair().expect("create transport pair");
         sender
             .write_all(&u64::MAX.to_le_bytes())
@@ -1580,12 +1549,12 @@ pub(in crate::channel::local) mod tests {
         sender.flush().expect("flush invalid raw handle value");
 
         let err = receiver
-            .recv_cpu_handle()
+            .recv_handle(FrameKind::Cpu)
             .expect_err("invalid handle value must be rejected");
         assert!(matches!(
             err,
             LavaFlowError::ChannelTransportOperation {
-                operation: "recv_cpu_handle",
+                operation: "recv_handle",
                 ..
             }
         ));
@@ -1649,7 +1618,7 @@ pub(in crate::channel::local) mod tests {
         drop(sender);
 
         let err = receiver
-            .recv_cpu_handle()
+            .recv_handle(FrameKind::Cpu)
             .expect_err("recv handle from closed sender pipe must fail");
         assert!(matches!(
             err,
@@ -1682,7 +1651,7 @@ pub(in crate::channel::local) mod tests {
             .expect("allocate payload");
 
         sender
-            .send_cpu_handle(buffer.shared_handle().expect("export shared handle"))
+            .send_handle(buffer.shared_handle().expect("export shared handle"))
             .expect("start pending transfer");
         support::set_fail("DuplicateHandleCloseSource");
         sender.abort_transfer();

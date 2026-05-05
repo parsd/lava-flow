@@ -7,7 +7,6 @@ impl InterprocessMemoryHandle {
         Self::GpuOpaqueWin32Handle(handle)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_cpu_shared_handle(handle: OwnedHandle) -> Self {
         Self::CpuSharedWin32Handle(handle)
     }
@@ -49,9 +48,21 @@ impl InterprocessMemoryHandle {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::windows::io::FromRawHandle;
+
+    pub(crate) mod support {
+        use crate::memory::allocator::InterprocessMemoryHandle;
+
+        pub(crate) fn handle_is_cpu(handle: &InterprocessMemoryHandle) -> bool {
+            matches!(handle, InterprocessMemoryHandle::CpuSharedWin32Handle(_))
+        }
+
+        pub(crate) fn handle_is_gpu(handle: &InterprocessMemoryHandle) -> bool {
+            matches!(handle, InterprocessMemoryHandle::GpuOpaqueWin32Handle(_))
+        }
+    }
 
     #[test]
     fn from_gpu_external_handle_returns_valid_handle() {
@@ -75,10 +86,7 @@ mod tests {
         let owned = unsafe { OwnedHandle::from_raw_handle(duplicated) };
         let handle = InterprocessMemoryHandle::from_gpu_external_handle(owned);
         assert!(handle.is_valid());
-        assert!(matches!(
-            handle,
-            InterprocessMemoryHandle::GpuOpaqueWin32Handle(_)
-        ));
+        assert!(support::handle_is_gpu(&handle));
     }
 
     #[test]
@@ -88,10 +96,7 @@ mod tests {
         let handle = buffer.shared_handle().expect("export cpu shared handle");
 
         let cloned = handle.try_clone().expect("clone cpu shared handle");
-        assert!(matches!(
-            cloned,
-            InterprocessMemoryHandle::CpuSharedWin32Handle(_)
-        ));
+        assert!(support::handle_is_cpu(&cloned));
         assert!(cloned.is_valid());
     }
 }

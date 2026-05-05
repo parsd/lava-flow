@@ -40,15 +40,6 @@ impl EndpointAddress {
     }
 }
 
-impl FrameKind {
-    pub(super) fn from_handle(handle: &InterprocessMemoryHandle) -> Self {
-        match handle {
-            InterprocessMemoryHandle::GpuOpaqueFd(_) => Self::Gpu,
-            InterprocessMemoryHandle::CpuSharedFd(_) => Self::Cpu,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(super) struct TransportSender {
     stream: UnixStream,
@@ -76,18 +67,11 @@ impl TransportSender {
         }
     }
 
-    pub(super) fn send_cpu_handle(&mut self, handle: InterprocessMemoryHandle) -> Result<()> {
-        let fd = match handle {
-            InterprocessMemoryHandle::CpuSharedFd(fd) => fd,
-            InterprocessMemoryHandle::GpuOpaqueFd(_) => {
-                return Err(channel_protocol_error(
-                    "send_cpu_handle",
-                    "unexpected gpu handle for cpu ipc",
-                ));
-            }
-        };
-
-        self.send_fd(&fd)
+    pub(super) fn send_handle(&mut self, handle: InterprocessMemoryHandle) -> Result<()> {
+        match handle {
+            InterprocessMemoryHandle::CpuSharedFd(fd)
+            | InterprocessMemoryHandle::GpuOpaqueFd(fd) => self.send_fd(&fd),
+        }
     }
 
     pub(super) fn complete_transfer(&mut self) {}
@@ -338,9 +322,12 @@ impl TransportReceiver {
         }
     }
 
-    pub(super) fn recv_cpu_handle(&mut self) -> Result<InterprocessMemoryHandle> {
-        self.recv_fd()
-            .map(InterprocessMemoryHandle::from_cpu_shared_fd)
+    pub(super) fn recv_handle(&mut self, kind: FrameKind) -> Result<InterprocessMemoryHandle> {
+        let fd = self.recv_fd()?;
+        match kind {
+            FrameKind::Cpu => Ok(InterprocessMemoryHandle::from_cpu_shared_fd(fd)),
+            FrameKind::Gpu => Ok(InterprocessMemoryHandle::from_gpu_external_fd(fd)),
+        }
     }
 
     fn recv_fd(&mut self) -> Result<OwnedFd> {
@@ -702,24 +689,6 @@ pub(in crate::channel::local) mod tests {
             err,
             LavaFlowError::ChannelTransportOperation {
                 operation: "sendmsg",
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn send_cpu_handle_rejects_gpu_handle_for_cpu_ipc() {
-        let (mut sender_transport, _receiver_transport) =
-            test_transport_pair().expect("create transport pair");
-        let handle = InterprocessMemoryHandle::from_gpu_external_fd(pipe_write_end());
-
-        let err = sender_transport
-            .send_cpu_handle(handle)
-            .expect_err("gpu handle must be rejected for cpu ipc");
-        assert!(matches!(
-            err,
-            LavaFlowError::ChannelTransportOperation {
-                operation: "send_cpu_handle",
                 ..
             }
         ));
@@ -1239,14 +1208,14 @@ pub(in crate::channel::local) mod tests {
     }
 
     #[test]
-    fn recv_cpu_handle_reports_recvmsg_failpoint() {
+    fn recv_handle_reports_recvmsg_failpoint() {
         support::set_fail("recvmsg");
 
         let (_sender_transport, mut receiver_transport) =
             test_transport_pair().expect("create transport pair");
 
         let err = receiver_transport
-            .recv_cpu_handle()
+            .recv_handle(FrameKind::Cpu)
             .expect_err("recvmsg failpoint must fail");
         assert!(matches!(
             err,
@@ -1258,7 +1227,7 @@ pub(in crate::channel::local) mod tests {
     }
 
     #[test]
-    fn recv_cpu_handle_reports_fcntl_failpoint() {
+    fn recv_handle_reports_fcntl_failpoint() {
         support::set_fail("fcntl_cloexec");
 
         let (sender_transport, mut receiver_transport) =
@@ -1268,7 +1237,7 @@ pub(in crate::channel::local) mod tests {
             .expect("send cpu handle fd");
 
         let err = receiver_transport
-            .recv_cpu_handle()
+            .recv_handle(FrameKind::Cpu)
             .expect_err("fcntl failpoint must fail");
         assert!(matches!(
             err,
@@ -1280,7 +1249,7 @@ pub(in crate::channel::local) mod tests {
     }
 
     #[test]
-    fn recv_cpu_handle_rejects_missing_received_handle() {
+    fn recv_handle_rejects_missing_received_handle() {
         let (mut sender_transport, mut receiver_transport) =
             test_transport_pair().expect("create transport pair");
         sender_transport
@@ -1289,7 +1258,7 @@ pub(in crate::channel::local) mod tests {
         sender_transport.flush().expect("flush marker");
 
         let err = receiver_transport
-            .recv_cpu_handle()
+            .recv_handle(FrameKind::Cpu)
             .expect_err("missing ancillary data must fail");
         assert!(matches!(
             err,
@@ -1301,7 +1270,7 @@ pub(in crate::channel::local) mod tests {
     }
 
     #[test]
-    fn recv_cpu_handle_rejects_unexpected_received_cmsg_type() {
+    fn recv_handle_rejects_unexpected_received_cmsg_type() {
         support::set_fail("recvmsg_unexpected_cmsg_type");
 
         let (sender_transport, mut receiver_transport) =
@@ -1311,7 +1280,7 @@ pub(in crate::channel::local) mod tests {
             .expect("send cpu handle fd");
 
         let err = receiver_transport
-            .recv_cpu_handle()
+            .recv_handle(FrameKind::Cpu)
             .expect_err("unexpected cmsg type must fail");
         assert!(matches!(
             err,
@@ -1323,7 +1292,7 @@ pub(in crate::channel::local) mod tests {
     }
 
     #[test]
-    fn recv_cpu_handle_rejects_missing_received_handle_with_failpoint() {
+    fn recv_handle_rejects_missing_received_handle_with_failpoint() {
         support::set_fail("recvmsg_missing_handle");
 
         let (sender_transport, mut receiver_transport) =
@@ -1333,7 +1302,7 @@ pub(in crate::channel::local) mod tests {
             .expect("send cpu handle fd");
 
         let err = receiver_transport
-            .recv_cpu_handle()
+            .recv_handle(FrameKind::Cpu)
             .expect_err("missing cmsg header must fail");
         assert!(matches!(
             err,

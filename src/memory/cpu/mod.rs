@@ -83,7 +83,6 @@ pub struct MemoryBuffer {
 
 impl MemoryBuffer {
     /// Imports a CPU shared-memory handle into a buffer with platform hard-limit validation.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_shared_handle(
         size: usize,
         handle: InterprocessMemoryHandle,
@@ -127,7 +126,6 @@ impl MemoryBuffer {
     }
 
     /// Returns the interprocess shared-memory handle for this CPU buffer.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn shared_handle(&self) -> Result<InterprocessMemoryHandle> {
         self.region.export_handle()
     }

@@ -5,7 +5,6 @@ mod windows;
 
 /// Unified interprocess memory handle wrapper for GPU and CPU shared memory.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum InterprocessMemoryHandle {
     /// Linux/Unix-like opaque file descriptor for Vulkan GPU memory.
     #[cfg(unix)]
@@ -19,4 +18,14 @@ pub(crate) enum InterprocessMemoryHandle {
     /// Windows mapping handle style identifier for CPU shared-memory transport.
     #[cfg(windows)]
     CpuSharedWin32Handle(std::os::windows::io::OwnedHandle),
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    pub(crate) mod support {
+        #[cfg(unix)]
+        pub(crate) use super::super::unix::tests::support::{handle_is_cpu, handle_is_gpu};
+        #[cfg(windows)]
+        pub(crate) use super::super::windows::tests::support::{handle_is_cpu, handle_is_gpu};
+    }
 }
