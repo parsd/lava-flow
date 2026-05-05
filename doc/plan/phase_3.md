@@ -34,9 +34,14 @@ Implemented now:
   `Builder::receiver(channel_id, my_location, peer_location)` for local scope
 - convenience `Builder::local_sender(channel_id)` / `Builder::local_receiver(channel_id)` using
   hostname detection for the common same-host case
-- `Sender` / `Receiver` local runtime for point-to-point CPU shared-memory transport
+- `Sender` / `Receiver` local runtime for point-to-point CPU and GPU shared-memory transport
 - versioned tagged local control protocol
+- local frame headers for CPU and GPU payloads:
+  - CPU: buffer size
+  - GPU: buffer size plus logical GPU device id for receive-side import
 - explicit receiver import `ImportOk` / `ImportFailed` ACK/NACK
+- CPU shared-memory handle transfer and import
+- GPU external-memory handle transfer and Vulkan import/export integration
 - configurable local protocol size limits:
   - payload cap
   - metadata cap
@@ -58,20 +63,19 @@ Not implemented yet:
 
 - remote builder/runtime path
 - receiver-side materialization allocator integration
-- GPU local handle transfer and Vulkan IPC transport wiring
 - true inter-process CPU and GPU test coverage
 - bootstrap authentication and optional peer-identity validation
 
 ## Phase Ordering
 
-Implementation should proceed in this order:
+Implementation has proceeded in this order:
 
-1. Local point-to-point CPU shared-memory transport implementation with internal listen/connect bootstrap.
-2. Builder integration around deterministic local endpoint naming derived from `ChannelId`.
-3. GPU allocator changes required for device-local, importable external-memory allocations.
-4. Local point-to-point Vulkan IPC transport implementation.
-5. True inter-process tests for CPU and GPU local IPC paths.
-6. Local bootstrap hardening:
+1. Local point-to-point CPU shared-memory transport implementation with internal listen/connect bootstrap. **Done.**
+2. Builder integration around deterministic local endpoint naming derived from `ChannelId`. **Done.**
+3. GPU allocator changes required for device-local, importable external-memory allocations. **Done.**
+4. Local point-to-point GPU external-handle transfer and Vulkan IPC integration. **Done.**
+5. True inter-process tests for CPU and GPU local IPC paths. **Remaining.**
+6. Local bootstrap hardening. **Remaining.**
    - optional OS peer validation during connection establishment
    - shared-secret HMAC challenge/response before any handle transfer or message I/O
 
@@ -79,7 +83,7 @@ Rationale:
 
 - CPU transport already has real handle export/import primitives and lower platform risk.
 - Local transport bootstrap should be owned by the library rather than pushed to users.
-- GPU transport has additional complexity beyond the control plane:
+- GPU transport had additional complexity beyond the control plane:
   - device-local/importable allocation requirements
   - Vulkan import path implementation
   - external synchronization follow-up
@@ -94,11 +98,13 @@ Rationale:
 - `ChannelAllocator` trait with fixed-target allocation-only implementations
 - No `src/memory/unified.rs` planning; allocator composition stays in traits/builders and existing module boundaries
 - Payload frame type (`Frame`) without embedded metadata
-- Metadata contract (`Metadata` + `MessageMeta`) with mandatory `used_size`
+- Metadata contract (`Metadata` + `MessageMeta`) with mandatory metadata envelope but no mandatory
+  `used_size` field; the transport carries buffer size in the frame header, and applications may add
+  valid-byte counts or other interpretation fields to metadata when needed
 - Receiver-level `ReceiveRepresentation` (`ExternalShare`, `Materialized`)
 - Sender-side metadata serialization configuration (codec selection), propagated during connect
-- `VulkanIpcTransport`
-- Local shared-memory transport integration
+- Local CPU shared-memory transport integration
+- Local GPU external-memory transport integration through the common local IPC protocol
 - Internal local rendezvous model (`listen` / `accept` / `connect`) hidden behind builders
 - Versioned tagged local control protocol with explicit receiver import ACK/NACK
 - Configurable local envelope-size limits enforced before metadata allocation or shared-memory
@@ -281,14 +287,14 @@ let tx = Builder::sender(channel_id.clone(), my_loc.clone(), peer_loc.clone())
 let rx = Builder::receiver(channel_id, my_loc, peer_loc).build()?;
 
 let meta = ImageMeta {
-    used_size: payload_bytes,
+    valid_bytes: Some(payload_bytes),
     width: 1920,
     height: 1080,
 };
 
 tx.send(payload_buffer, &meta)?;
 let (frame, meta) = rx.recv::<ImageMeta>()?;
-let used = meta.used_size();
+let valid_bytes = meta.valid_bytes;
 
 let representation = rx.receive_representation();
 ```
