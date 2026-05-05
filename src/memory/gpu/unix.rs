@@ -146,8 +146,17 @@ impl DeviceContext {
 mod tests {
     use super::*;
     use crate::error::LavaFlowError;
+    use std::os::fd::{FromRawFd, IntoRawFd};
 
     const BUFFER_SIZE: usize = 64;
+
+    fn pipe_write_fd_for_test() -> OwnedFd {
+        let mut fds = [0; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "create pipe for external fd");
+        let _read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        unsafe { OwnedFd::from_raw_fd(fds[1]) }
+    }
 
     fn cpu_shared_handle_for_test() -> InterprocessMemoryHandle {
         crate::memory::cpu::Allocator::with_max_allocation_size(usize::MAX)
@@ -155,6 +164,67 @@ mod tests {
             .expect("allocate cpu buffer")
             .shared_handle()
             .expect("export cpu shared handle")
+    }
+
+    #[test]
+    fn required_extensions_expose_platform_external_memory_extension() {
+        let extensions = ExternalMemoryDevice::required_extensions();
+
+        assert_eq!(extensions.len(), 1);
+        let extension = unsafe { std::ffi::CStr::from_ptr(extensions[0]) };
+        assert_eq!(extension, ash::khr::external_memory_fd::NAME);
+    }
+
+    #[test]
+    fn external_memory_handle_type_matches_platform() {
+        assert!(EXTERNAL_MEMORY_HANDLE_TYPE == vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+        assert!(EXTERNAL_MEMORY_HANDLE_TYPE.contains(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD));
+    }
+
+    #[test]
+    fn from_interprocess_handle_accepts_gpu_handle_directly() {
+        let handle = InterprocessMemoryHandle::from_gpu_external_fd(pipe_write_fd_for_test());
+        let external = ExternalHandle::from_interprocess_handle(handle).expect("gpu handle");
+
+        assert!(external.as_fd().as_raw_fd() >= 0);
+    }
+
+    #[test]
+    fn external_handle_duplicates_pipe_fd_without_vulkan_context() {
+        let handle = InterprocessMemoryHandle::from_gpu_external_fd(pipe_write_fd_for_test());
+        let external = ExternalHandle::from_interprocess_handle(handle).expect("gpu handle");
+
+        let cloned = external.try_clone().expect("clone external fd");
+        assert!(cloned.as_fd().as_raw_fd() >= 0);
+
+        let ipc_handle = external.duplicate_for_ipc().expect("duplicate for ipc");
+        assert!(crate::memory::allocator::tests::support::handle_is_gpu(
+            &ipc_handle
+        ));
+        let round_tripped =
+            ExternalHandle::from_interprocess_handle(ipc_handle).expect("round-trip gpu handle");
+        assert!(round_tripped.as_fd().as_raw_fd() >= 0);
+    }
+
+    #[test]
+    fn external_handle_debug_uses_type_name() {
+        let handle = InterprocessMemoryHandle::from_gpu_external_fd(pipe_write_fd_for_test());
+        let external = ExternalHandle::from_interprocess_handle(handle).expect("gpu handle");
+
+        assert!(format!("{external:?}").contains("ExternalHandle"));
+    }
+
+    #[test]
+    fn from_interprocess_handle_rejects_cpu_handle_directly() {
+        let err = ExternalHandle::from_interprocess_handle(cpu_shared_handle_for_test())
+            .expect_err("cpu handle must be rejected");
+
+        assert!(matches!(
+            err,
+            LavaFlowError::UnsupportedInterprocessHandle {
+                kind: "CpuSharedFd",
+            }
+        ));
     }
 
     #[test]
@@ -170,6 +240,48 @@ mod tests {
             let handle = external.duplicate_for_ipc().expect("duplicate for ipc");
             assert!(crate::memory::allocator::tests::support::handle_is_gpu(
                 &handle
+            ));
+        }
+    }
+
+    #[test]
+    fn external_handle_supports_public_fd_accessors_and_conversions() {
+        if let Ok(allocator) = super::super::Allocator::new() {
+            let buffer = allocator
+                .allocate(BUFFER_SIZE)
+                .expect("allocate gpu buffer");
+            let external = buffer.external_handle().expect("export external handle");
+            assert!(external.as_fd().as_raw_fd() >= 0);
+            assert!(AsFd::as_fd(&external).as_raw_fd() >= 0);
+            assert!(AsRawFd::as_raw_fd(&external) >= 0);
+
+            let cloned = external.try_clone().expect("clone external handle");
+            let owned = OwnedFd::from(cloned);
+            assert!(owned.as_raw_fd() >= 0);
+
+            let raw = IntoRawFd::into_raw_fd(external);
+            let _owned_again = unsafe { OwnedFd::from_raw_fd(raw) };
+        }
+    }
+
+    #[test]
+    fn import_memory_handle_rejects_cpu_handle_before_vulkan_import() {
+        if let Ok(allocator) = super::super::Allocator::new() {
+            let err = allocator
+                .context
+                .import_memory_handle(
+                    vk::Buffer::null(),
+                    BUFFER_SIZE as u64,
+                    0,
+                    cpu_shared_handle_for_test(),
+                )
+                .expect_err("cpu handle must not be accepted by gpu import");
+
+            assert!(matches!(
+                err,
+                LavaFlowError::UnsupportedInterprocessHandle {
+                    kind: "CpuSharedFd",
+                }
             ));
         }
     }

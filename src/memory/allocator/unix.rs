@@ -78,4 +78,32 @@ pub(crate) mod tests {
         assert!(handle.is_valid());
         assert!(support::handle_is_cpu(&handle));
     }
+
+    #[test]
+    fn gpu_external_fd_try_clone_preserves_gpu_variant() {
+        let mut fds = [0; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "create pipe for gpu handle");
+        let _read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let owned = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let handle = InterprocessMemoryHandle::from_gpu_external_fd(owned);
+
+        let cloned = handle.try_clone().expect("clone gpu external handle");
+        assert!(support::handle_is_gpu(&cloned));
+        assert!(cloned.is_valid());
+    }
+
+    #[test]
+    fn cpu_shared_fd_try_clone_preserves_cpu_variant() {
+        let mut fds = [0; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "create pipe for cpu handle");
+        let _read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let owned = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let handle = InterprocessMemoryHandle::from_cpu_shared_fd(owned);
+
+        let cloned = handle.try_clone().expect("clone cpu shared handle");
+        assert!(support::handle_is_cpu(&cloned));
+        assert!(cloned.is_valid());
+    }
 }

@@ -64,8 +64,7 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn from_gpu_external_handle_returns_valid_handle() {
+    fn duplicate_current_process_handle_for_test() -> OwnedHandle {
         use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -83,10 +82,27 @@ pub(crate) mod tests {
             )
         };
         assert_ne!(ok, 0, "duplicate current process handle");
-        let owned = unsafe { OwnedHandle::from_raw_handle(duplicated) };
-        let handle = InterprocessMemoryHandle::from_gpu_external_handle(owned);
+        unsafe { OwnedHandle::from_raw_handle(duplicated) }
+    }
+
+    #[test]
+    fn from_gpu_external_handle_returns_valid_handle() {
+        let handle = InterprocessMemoryHandle::from_gpu_external_handle(
+            duplicate_current_process_handle_for_test(),
+        );
         assert!(handle.is_valid());
         assert!(support::handle_is_gpu(&handle));
+    }
+
+    #[test]
+    fn gpu_external_handle_try_clone_preserves_gpu_variant() {
+        let handle = InterprocessMemoryHandle::from_gpu_external_handle(
+            duplicate_current_process_handle_for_test(),
+        );
+
+        let cloned = handle.try_clone().expect("clone gpu external handle");
+        assert!(support::handle_is_gpu(&cloned));
+        assert!(cloned.is_valid());
     }
 
     #[test]
