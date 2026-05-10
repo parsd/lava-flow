@@ -1,6 +1,6 @@
 # Phase 3: Local Channel Runtime
 
-**Status:** In Progress
+**Status:** Completed
 
 ## TL;DR
 
@@ -61,12 +61,13 @@ Implemented now:
     - `XDG_RUNTIME_DIR/lava-flow/`
     - `/run/user/<uid>/lava-flow/`
     - `$HOME/.local/run/lava-flow/`
+- local bootstrap hardening:
+  - shared-secret HMAC challenge/response before message or handle transfer
+  - optional expected peer process-id validation
+  - explicit auth-mode negotiation and mismatch failure
+  - RustCrypto-backed auth implementation isolated behind the `rustcrypto-auth` feature module
 
-Not implemented yet:
-
-- remote builder/runtime path
-- receiver-side materialization allocator integration
-- bootstrap authentication and optional peer-identity validation
+Remaining work that was identified during Phase 3 has moved to [Phase 4](phase_4.md).
 
 ## Phase Ordering
 
@@ -77,9 +78,15 @@ Implementation has proceeded in this order:
 3. GPU allocator changes required for device-local, importable external-memory allocations. **Done.**
 4. Local point-to-point GPU external-handle transfer and Vulkan IPC integration. **Done.**
 5. True inter-process tests for CPU and GPU local IPC paths. **Done.**
-6. Local bootstrap hardening. **Remaining.**
-   - optional OS peer validation during connection establishment
-   - shared-secret HMAC challenge/response before any handle transfer or message I/O
+6. Local bootstrap hardening. **Done for local IPC.**
+   - opt-in shared-secret HMAC challenge/response before any handle transfer or message I/O
+   - explicit auth-mode negotiation: both peers must either configure the same shared-secret mode or
+     both leave authentication disabled
+   - optional expected peer process-id validation during connection establishment
+   - RustCrypto dependency selection and feature-gating are captured in
+     [ADR-018](../adr/018-rustcrypto-local-ipc-authentication.md)
+   - the crypto implementation and unsupported no-default behavior are isolated behind
+     `src/channel/local/auth/`
 
 Rationale:
 
@@ -159,8 +166,8 @@ builder-construction time.
 
 ### Current Security Baseline
 
-The current local runtime now applies platform-local access control before challenge/response is
-introduced:
+The current local runtime applies platform-local access control plus optional shared-secret
+bootstrap authentication:
 
 - Windows:
   - duplex named pipe is created with an explicit DACL
@@ -181,11 +188,11 @@ introduced:
   - default payload cap is `1 GiB`
   - default metadata cap is `1 MiB`
   - the local sender/listener and receiver are constructed with explicit limits
-  - public builders expose separate local maximum payload and metadata size setters so callers do
+  - public builders expose separate maximum payload and metadata size setters so callers do
     not have to pass two same-typed limit values in one call
 
-This is the currently implemented baseline. It reduces cross-user access and bounds envelope
-resource use, but it does not yet authenticate that the connected peer is the intended process.
+This is the currently implemented baseline. It reduces cross-user access, bounds envelope resource
+use, and can authenticate the intended peer when both sides opt into shared-secret authentication.
 
 ### Current Phase 3 Default
 
@@ -197,9 +204,9 @@ For local point-to-point transport bootstrap, the current default should be:
 That default keeps the bootstrap model compatible with a future local 1 -> many broadcast mode,
 where one logical sender may accept multiple transport clients over time.
 
-## Deferred Fan-Out
+## Fan-Out Follow-Up
 
-Multiple receivers for one sender are explicitly out of scope for Phase 3.
+Multiple receivers for one sender were explicitly out of scope for Phase 3.
 
 Future fan-out support should be introduced as a separate semantic mode, most likely local
 broadcast/fan-out, with these runtime implications:
@@ -218,12 +225,12 @@ Remote fan-out should remain compatible with the same semantic boundary:
 This expansion should reuse the same bootstrap model and public `Frame` / metadata API rather than
 introducing a second payload abstraction.
 
-## Deferred Bootstrap Authentication
+## Local Bootstrap Authentication
 
-Bootstrap authentication should be implemented as a later Phase 3 hardening step, not as part of
-the initial local transport bring-up.
+Bootstrap authentication is implemented as the final Phase 3 hardening step for local IPC, after the
+basic local transport and true inter-process tests.
 
-Recommended shape:
+Implemented shape:
 
 - primary authentication mechanism:
   - nonce-based challenge/response using a shared secret
@@ -232,7 +239,14 @@ Recommended shape:
     - `ChannelId`
     - both nonces
     - local protocol version
+    - metadata encoding
+    - local access policy
+    - authenticated endpoint role
 - authentication must complete before any handle transfer or channel message I/O
+- auth configuration is opt-in, but must match on both peers:
+  - both peers with no shared secret: unauthenticated bootstrap with connection acknowledgement
+  - both peers with the same shared secret: HMAC-authenticated bootstrap
+  - only one peer with a secret, or different secrets: bootstrap fails
 - optional OS peer validation should be supported as a pre-auth filter:
   - Unix:
     - `SameUser`
@@ -250,6 +264,11 @@ Rationale:
   main authentication mechanism
 - `ProcessId` is useful for orchestrated cases where the caller already knows the peer PID, but it
   should stay optional because PIDs are ephemeral and app-supplied
+- RustCrypto authentication dependencies are behind the default `rustcrypto-auth` feature so builds
+  can opt out when shared-secret local IPC authentication is not used.
+- the local auth backend is split into `src/channel/local/auth/rustcrypto.rs` and
+  `src/channel/local/auth/unsupported.rs`, keeping feature-dependent code out of the main local
+  protocol state machine.
 
 ## Encapsulation Boundary
 
@@ -269,15 +288,11 @@ or wrapper libraries can import the external-memory handle into their own device
 `gpu::EXTERNAL_MEMORY_HANDLE_TYPE` plus buffer metadata such as `size()`, `allocation_size()`, and
 `device_id()`.
 
-## Deferred Follow-Up
+## Follow-Up
 
-- Async receiver loops and dispatch integration are explicitly deferred until the synchronous local runtime shape is
-  validated in code.
-- ADR-010 currently describes a non-blocking API that does not match the sync-first Phase 3 plan; reconcile that after the
-  synchronous local runtime is proven out.
-- Local fan-out / multi-receiver semantics are deferred until point-to-point local transport is stable.
-- Bootstrap authentication is deferred until the basic point-to-point local runtime and true
-  inter-process tests are stable.
+Phase 3 is complete for point-to-point synchronous local IPC. Remote transport, receive
+materialization, async/dispatch shape, ADR-010 reconciliation, and multi-receiver semantics are
+tracked from [Phase 4](phase_4.md) onward.
 
 ## Example (API Shape)
 

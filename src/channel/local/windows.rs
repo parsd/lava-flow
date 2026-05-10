@@ -32,9 +32,9 @@ impl EndpointAddress {
             Access::CurrentSession => "current-session",
             Access::AuthenticatedUsers => "authenticated-users",
         };
+        let channel_segment = channel_id.as_str();
         Self(format!(
-            r"\\.\pipe\lava-flow-{access_segment}-{}",
-            channel_id.as_str()
+            r"\\.\pipe\lava-flow-{access_segment}-{channel_segment}",
         ))
     }
 
@@ -225,11 +225,16 @@ impl NamedPipeSecurityDescriptor {
 #[derive(Debug)]
 pub(super) struct TransportSender {
     pipe: File,
+    peer_process_id: u32,
     peer_process: OwnedHandle,
     pending_remote_handle: Option<RawHandle>,
 }
 
 impl TransportSender {
+    pub(super) fn peer_process_id(&self) -> Result<u32> {
+        Ok(self.peer_process_id)
+    }
+
     pub(super) fn read_exact(&mut self, bytes: &mut [u8]) -> Result<()> {
         self.pipe
             .read_exact(bytes)
@@ -383,6 +388,7 @@ impl TransportListener {
             .map_err(|source| channel_transport_error("OpenProcess", source))?;
         Ok(TransportSender {
             pipe: File::from(server),
+            peer_process_id,
             peer_process,
             pending_remote_handle: None,
         })
@@ -403,6 +409,12 @@ impl TransportReceiver {
         Ok(Self {
             pipe: File::from(client),
         })
+    }
+
+    pub(super) fn peer_process_id(&self) -> Result<u32> {
+        SYSCALLS
+            .get_named_pipe_server_process_id(self.pipe.as_raw_handle())
+            .map_err(|source| channel_transport_error("GetNamedPipeServerProcessId", source))
     }
 
     pub(super) fn read_exact(&mut self, bytes: &mut [u8]) -> Result<()> {
@@ -495,6 +507,7 @@ trait Syscalls: Sync {
         acl: *mut ACL,
     ) -> std::io::Result<()>;
     fn get_named_pipe_client_process_id(&self, handle: RawHandle) -> std::io::Result<u32>;
+    fn get_named_pipe_server_process_id(&self, handle: RawHandle) -> std::io::Result<u32>;
     fn open_process_duplicatable_handle(&self, process_id: u32) -> std::io::Result<OwnedHandle>;
     fn duplicate_handle_to_process(
         &self,
@@ -814,6 +827,18 @@ impl Syscalls for RealSyscalls {
         }
     }
 
+    fn get_named_pipe_server_process_id(&self, handle: RawHandle) -> std::io::Result<u32> {
+        use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+
+        let mut process_id = 0_u32;
+        let ok = unsafe { GetNamedPipeServerProcessId(handle, &mut process_id) };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(process_id)
+        }
+    }
+
     fn open_process_duplicatable_handle(&self, process_id: u32) -> std::io::Result<OwnedHandle> {
         use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_DUP_HANDLE};
 
@@ -964,7 +989,8 @@ pub(in crate::channel::local) mod tests {
             static COUNTER: AtomicU64 = AtomicU64::new(1);
 
             let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let channel_id = ChannelId::new(format!("windows-channel-{id}")).expect("channel id");
+            let channel_id = ChannelId::new(format!("windows-channel-{}-{id}", std::process::id()))
+                .expect("channel id");
             EndpointAddress::from_channel(&channel_id, Access::CurrentSession)
         }
 
@@ -1094,6 +1120,16 @@ pub(in crate::channel::local) mod tests {
                     ))
                 } else {
                     RealSyscalls.get_named_pipe_client_process_id(handle)
+                }
+            }
+
+            fn get_named_pipe_server_process_id(&self, handle: RawHandle) -> std::io::Result<u32> {
+                if should_fail("GetNamedPipeServerProcessId") {
+                    Err(std::io::Error::other(
+                        "GetNamedPipeServerProcessId failpoint",
+                    ))
+                } else {
+                    RealSyscalls.get_named_pipe_server_process_id(handle)
                 }
             }
 
@@ -1668,8 +1704,11 @@ pub(in crate::channel::local) mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let channel_id =
-            ChannelId::new(format!("allow-authenticated-users-{id}")).expect("channel id");
+        let channel_id = ChannelId::new(format!(
+            "allow-authenticated-users-{}-{id}",
+            std::process::id()
+        ))
+        .expect("channel id");
         let address = EndpointAddress::from_channel(&channel_id, Access::AuthenticatedUsers);
 
         let mut security = NamedPipeSecurityDescriptor::for_local_access(
@@ -1703,8 +1742,11 @@ pub(in crate::channel::local) mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(2);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let channel_id =
-            ChannelId::new(format!("allow-current-logon-session-{id}")).expect("channel id");
+        let channel_id = ChannelId::new(format!(
+            "allow-current-logon-session-{}-{id}",
+            std::process::id()
+        ))
+        .expect("channel id");
         let address = EndpointAddress::from_channel(&channel_id, Access::CurrentSession);
 
         let mut security = NamedPipeSecurityDescriptor::for_local_access(

@@ -155,6 +155,20 @@ pub enum LavaFlowError {
     #[error("channel transport disconnected")]
     ChannelDisconnected,
 
+    /// Channel bootstrap authentication failed.
+    #[error("channel authentication failed: {reason}")]
+    ChannelAuthenticationFailed {
+        /// Human-readable failure reason.
+        reason: &'static str,
+    },
+
+    /// Requested channel authentication mechanism is not available in this build.
+    #[error("unsupported channel authentication mechanism: {mechanism}")]
+    UnsupportedChannelAuthentication {
+        /// Authentication mechanism name.
+        mechanism: &'static str,
+    },
+
     /// Blocking channel endpoint construction was cancelled before it completed.
     #[error("channel build cancelled for {endpoint} endpoint")]
     ChannelBuildCancelled {

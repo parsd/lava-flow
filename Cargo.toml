@@ -3,12 +3,20 @@ name = "lava-flow"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["rustcrypto-auth"]
+rustcrypto-auth = ["dep:getrandom", "dep:hmac", "dep:sha2", "dep:zeroize"]
+
 [dependencies]
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 hostname = "0.4"
 ash = { version = "0.38", default-features = false, features = ["loaded"] }
+getrandom = { version = "0.3", optional = true }
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+zeroize = { version = "1.8", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

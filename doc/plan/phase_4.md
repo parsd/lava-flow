@@ -11,7 +11,15 @@ Remote receive materialization uses receiver-channel allocator strategy.
 - MPI init/finalize wrapper
 - Rank resolution from process locations
 - `MpiTransport` send/recv (blocking and optional non-blocking)
+- Remote builder/runtime path behind the existing directional channel API
 - Receiver representation mapping to `ExternalShare` / `Materialized` for remote channels
+- Receiver-side materialization allocator integration for remote payloads
+- Remote authenticated transport semantics, reusing the Phase 3 local authentication assurances
+  where they apply to MPI or other remote bootstrap paths
+- Reconciliation of ADR-010 with the sync-first local runtime proven in Phase 3
+  transport path is implemented
+- Local or remote fan-out/multi-receiver semantics as a separate mode, not a change to the
+  point-to-point `Sender` / `Receiver` contract
 - CI-safe tests gated behind `mpirun`
 
 ## Deliverables
@@ -19,6 +27,8 @@ Remote receive materialization uses receiver-channel allocator strategy.
 - `MpiContext` wrapper
 - `RankResolver` for hostname -> rank mapping
 - `MpiTransport` implementation
+- Remote authenticated-bootstrap plan and implementation hooks
+- Receiver materialization configuration wired through builders
 - Integration tests runnable with `mpirun -n 2`
 
 ## Example (API Shape)

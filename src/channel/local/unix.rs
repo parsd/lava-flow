@@ -27,9 +27,10 @@ impl EndpointAddress {
                 .join(unsafe { libc::geteuid() }.to_string())
                 .join("lava-flow"),
         };
+        let channel_segment = channel_id.as_str();
         let filename = match access {
-            Access::CurrentSession => format!("{}.sock", channel_id.as_str()),
-            Access::AuthenticatedUsers => format!("lava-flow-{}.sock", channel_id.as_str()),
+            Access::CurrentSession => format!("{channel_segment}.sock"),
+            Access::AuthenticatedUsers => format!("lava-flow-{channel_segment}.sock"),
         };
         let path = base.join(filename);
         Self(path.to_string_lossy().into_owned())
@@ -46,6 +47,10 @@ pub(super) struct TransportSender {
 }
 
 impl TransportSender {
+    pub(super) fn peer_process_id(&self) -> Result<u32> {
+        peer_process_id(self.stream.as_raw_fd())
+    }
+
     pub(super) fn read_exact(&mut self, bytes: &mut [u8]) -> Result<()> {
         match self.stream.read_exact(bytes) {
             Ok(()) => Ok(()),
@@ -301,6 +306,10 @@ impl TransportReceiver {
         Ok(Self { stream })
     }
 
+    pub(super) fn peer_process_id(&self) -> Result<u32> {
+        peer_process_id(self.stream.as_raw_fd())
+    }
+
     pub(super) fn read_exact(&mut self, bytes: &mut [u8]) -> Result<()> {
         match self.stream.read_exact(bytes) {
             Ok(()) => Ok(()),
@@ -373,6 +382,44 @@ impl TransportReceiver {
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
         Ok(owned)
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_process_id(fd: std::os::fd::RawFd) -> Result<u32> {
+    let mut credentials = unsafe { std::mem::zeroed::<libc::ucred>() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(channel_transport_error(
+            "getsockopt_SO_PEERCRED",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    u32::try_from(credentials.pid).map_err(|_| {
+        channel_transport_error(
+            "getsockopt_SO_PEERCRED",
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "peer pid out of range"),
+        )
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn peer_process_id(_fd: std::os::fd::RawFd) -> Result<u32> {
+    Err(channel_transport_error(
+        "getsockopt_SO_PEERCRED",
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "peer process id validation is not implemented on this Unix platform",
+        ),
+    ))
 }
 
 fn runtime_dir_path(access: Access) -> Option<PathBuf> {
@@ -533,7 +580,10 @@ pub(crate) struct TestRuntimeDirGuard {
 #[cfg(test)]
 pub(crate) fn stable_test_runtime_dir_guard(test_name: &str, id: u64) -> TestRuntimeDirGuard {
     let runtime_dir = env::temp_dir()
-        .join(format!("lava-flow-public-channel-{test_name}-{id}"))
+        .join(format!(
+            "lava-flow-public-channel-{test_name}-{}-{id}",
+            std::process::id()
+        ))
         .to_string_lossy()
         .into_owned();
     TestRuntimeDirGuard {
@@ -584,7 +634,8 @@ pub(in crate::channel::local) mod tests {
             static COUNTER: AtomicU64 = AtomicU64::new(1);
 
             let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let channel_id = ChannelId::new(format!("unix-channel-{id}")).expect("channel id");
+            let channel_id = ChannelId::new(format!("unix-channel-{}-{id}", std::process::id()))
+                .expect("channel id");
             let path = env::temp_dir()
                 .join(format!("lava-flow-tests-{}", std::process::id()))
                 .join(format!("{}.sock", channel_id.as_str()));
@@ -699,9 +750,11 @@ pub(in crate::channel::local) mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base =
-            TempDir::create(std::env::temp_dir().join(format!("lava-flow-unix-bind-test-{id}")))
-                .expect("create test base directory");
+        let base = TempDir::create(std::env::temp_dir().join(format!(
+            "lava-flow-unix-bind-test-{}-{id}",
+            std::process::id()
+        )))
+        .expect("create test base directory");
         let base_string = base.path().to_string_lossy().into_owned();
         let _guard = EnvGuard::set("XDG_RUNTIME_DIR", &base_string);
 
@@ -711,7 +764,8 @@ pub(in crate::channel::local) mod tests {
         TransportListener::ensure_endpoint_dir_exists(&socket_path, Access::CurrentSession)
             .expect("create runtime directory");
 
-        let channel_id = ChannelId::new("bind-remove-file-error").expect("channel id");
+        let channel_id = ChannelId::new(format!("bind-remove-file-error-{}", std::process::id()))
+            .expect("channel id");
         let address = EndpointAddress::from_channel(&channel_id, Access::CurrentSession);
         fs::create_dir_all(address.as_str()).expect("create blocking directory at socket path");
 
@@ -745,9 +799,13 @@ pub(in crate::channel::local) mod tests {
 
     #[test]
     fn authenticated_users_endpoint_uses_system_temp_directory() {
-        let channel_id = ChannelId::new("auth-users-channel").expect("channel id");
+        let channel_id = ChannelId::new(format!("auth-users-channel-{}", std::process::id()))
+            .expect("channel id");
         let address = EndpointAddress::from_channel(&channel_id, Access::AuthenticatedUsers);
-        let expected = std::env::temp_dir().join("lava-flow-auth-users-channel.sock");
+        let expected = std::env::temp_dir().join(format!(
+            "lava-flow-auth-users-channel-{}.sock",
+            std::process::id()
+        ));
 
         assert_eq!(PathBuf::from(address.as_str()), expected);
     }
@@ -799,9 +857,11 @@ pub(in crate::channel::local) mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base =
-            TempDir::create(std::env::temp_dir().join(format!("lava-flow-unix-runtime-test-{id}")))
-                .expect("create test base directory");
+        let base = TempDir::create(std::env::temp_dir().join(format!(
+            "lava-flow-unix-runtime-test-{}-{id}",
+            std::process::id()
+        )))
+        .expect("create test base directory");
         let base_string = base.path().to_string_lossy().into_owned();
         let _guard = EnvGuard::set("XDG_RUNTIME_DIR", &base_string);
 
@@ -841,9 +901,11 @@ pub(in crate::channel::local) mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let directory =
-            TempDir::create(std::env::temp_dir().join(format!("lava-flow-validate-runtime-{id}")))
-                .expect("create runtime directory");
+        let directory = TempDir::create(std::env::temp_dir().join(format!(
+            "lava-flow-validate-runtime-{}-{id}",
+            std::process::id()
+        )))
+        .expect("create runtime directory");
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
             .expect("set private permissions");
 
@@ -856,7 +918,10 @@ pub(in crate::channel::local) mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("lava-flow-runtime-file-{id}"));
+        let path = std::env::temp_dir().join(format!(
+            "lava-flow-runtime-file-{}-{id}",
+            std::process::id()
+        ));
         let file = TempFile::with_contents(path, b"not a directory").expect("create runtime file");
 
         let err = TransportListener::validate_runtime_dir(file.path())
@@ -871,13 +936,36 @@ pub(in crate::channel::local) mod tests {
     }
 
     #[test]
+    fn validate_runtime_dir_reports_missing_path() {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "lava-flow-missing-runtime-{}-{id}",
+            std::process::id()
+        ));
+
+        let err = TransportListener::validate_runtime_dir(&path)
+            .expect_err("missing runtime directory must be reported");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "validate_runtime_dir",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn validate_private_runtime_dir_rejects_group_or_other_permissions() {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let directory =
-            TempDir::create(std::env::temp_dir().join(format!("lava-flow-public-runtime-{id}")))
-                .expect("create runtime directory");
+        let directory = TempDir::create(std::env::temp_dir().join(format!(
+            "lava-flow-public-runtime-{}-{id}",
+            std::process::id()
+        )))
+        .expect("create runtime directory");
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755))
             .expect("set public permissions");
 
@@ -893,11 +981,41 @@ pub(in crate::channel::local) mod tests {
     }
 
     #[test]
+    fn validate_public_runtime_dir_uses_private_rules_for_current_session() {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory = TempDir::create(std::env::temp_dir().join(format!(
+            "lava-flow-current-session-public-check-{}-{id}",
+            std::process::id()
+        )))
+        .expect("create runtime directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755))
+            .expect("set public permissions");
+
+        let err = TransportListener::validate_public_runtime_dir(
+            directory.path(),
+            Access::CurrentSession,
+        )
+        .expect_err("current-session validation must still require private permissions");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "validate_runtime_dir",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn validate_public_runtime_dir_rejects_regular_file() {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("lava-flow-public-runtime-file-{id}"));
+        let path = std::env::temp_dir().join(format!(
+            "lava-flow-public-runtime-file-{}-{id}",
+            std::process::id()
+        ));
         let file =
             TempFile::with_contents(path, b"not a directory").expect("create public runtime file");
 
@@ -918,9 +1036,10 @@ pub(in crate::channel::local) mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let directory = TempDir::create(
-            std::env::temp_dir().join(format!("lava-flow-public-runtime-private-{id}")),
-        )
+        let directory = TempDir::create(std::env::temp_dir().join(format!(
+            "lava-flow-public-runtime-private-{}-{id}",
+            std::process::id()
+        )))
         .expect("create public runtime directory");
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
             .expect("set private permissions");
@@ -944,7 +1063,10 @@ pub(in crate::channel::local) mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("lava-flow-runtime-parent-file-{id}"));
+        let path = std::env::temp_dir().join(format!(
+            "lava-flow-runtime-parent-file-{}-{id}",
+            std::process::id()
+        ));
         let file =
             TempFile::with_contents(path, b"not a directory").expect("create blocking parent file");
         let socket_path = file.path().join("blocked.sock");
@@ -966,9 +1088,10 @@ pub(in crate::channel::local) mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base =
-            TempDir::create(std::env::temp_dir().join(format!("lava-flow-long-socket-{id}")))
-                .expect("create long socket base");
+        let base = TempDir::create(
+            std::env::temp_dir().join(format!("lava-flow-long-socket-{}-{id}", std::process::id())),
+        )
+        .expect("create long socket base");
         let path = base.path().join(format!("{}.sock", "a".repeat(200)));
         let address = EndpointAddress(path.to_string_lossy().into_owned());
 
@@ -1017,9 +1140,11 @@ pub(in crate::channel::local) mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base =
-            TempDir::create(std::env::temp_dir().join(format!("lava-flow-unix-symlink-test-{id}")))
-                .expect("create test base directory");
+        let base = TempDir::create(std::env::temp_dir().join(format!(
+            "lava-flow-unix-symlink-test-{}-{id}",
+            std::process::id()
+        )))
+        .expect("create test base directory");
         let target = base.path().join("target");
         let runtime_link = base.path().join("runtime-link");
         fs::create_dir_all(&target).expect("create target directory");
@@ -1429,5 +1554,18 @@ pub(in crate::channel::local) mod tests {
             err.raw_os_error().is_some(),
             "expected invalid fd to yield an OS error, got {err:?}"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn peer_process_id_reports_os_error_for_invalid_fd() {
+        let err = peer_process_id(-1).expect_err("invalid fd must fail peer pid lookup");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "getsockopt_SO_PEERCRED",
+                ..
+            }
+        ));
     }
 }

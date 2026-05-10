@@ -7,11 +7,13 @@ use std::convert::TryFrom;
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod auth;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
 mod windows;
 
+use auth::{AuthSetupError, SharedSecret};
 use platform::EndpointAddress;
 #[cfg(unix)]
 use unix as platform;
@@ -23,13 +25,105 @@ const DEFAULT_MAX_LOCAL_CHANNEL_PAYLOAD_SIZE: usize = 1024 * 1024 * 1024;
 const DEFAULT_MAX_LOCAL_CHANNEL_METADATA_SIZE: usize = 1024 * 1024;
 
 /// Local IPC peer access policy selected by public builder convenience methods.
+#[repr(u8)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Access {
     /// Restrict local IPC to the current Windows logon session or Unix user.
     #[default]
-    CurrentSession,
+    CurrentSession = 1,
     /// Allow authenticated local OS users to connect to the local IPC endpoint.
-    AuthenticatedUsers,
+    AuthenticatedUsers = 2,
+}
+
+impl TryFrom<u8> for Access {
+    type Error = LavaFlowError;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(Self::CurrentSession),
+            2 => Ok(Self::AuthenticatedUsers),
+            _ => Err(channel_protocol_error(
+                "decode_local_access",
+                "unknown local access policy",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AuthOptions {
+    shared_secret: Option<std::result::Result<SharedSecret, AuthSetupError>>,
+    expected_peer_process_id: Option<u32>,
+}
+
+impl AuthOptions {
+    pub(crate) fn with_shared_secret(mut self, secret: Vec<u8>) -> Self {
+        self.shared_secret = Some(SharedSecret::new(secret));
+        self
+    }
+
+    pub(crate) fn with_expected_peer_process_id(mut self, process_id: u32) -> Self {
+        self.expected_peer_process_id = Some(process_id);
+        self
+    }
+
+    fn auth_mode(&self) -> AuthMode {
+        match self.shared_secret {
+            Some(_) => AuthMode::SharedSecretHmacSha256,
+            None => AuthMode::None,
+        }
+    }
+
+    fn secret(&self) -> Result<Option<&SharedSecret>> {
+        match &self.shared_secret {
+            Some(Ok(secret)) => Ok(Some(secret)),
+            Some(Err(error)) => Err(error.to_error()),
+            None => Ok(None),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BootstrapOptions {
+    #[cfg(feature = "rustcrypto-auth")]
+    channel_id: ChannelId,
+    access: Access,
+    auth: AuthOptions,
+}
+
+impl BootstrapOptions {
+    pub(crate) fn new(channel_id: ChannelId, access: Access, auth: AuthOptions) -> Self {
+        #[cfg(not(feature = "rustcrypto-auth"))]
+        let _ = channel_id;
+        Self {
+            #[cfg(feature = "rustcrypto-auth")]
+            channel_id,
+            access,
+            auth,
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum AuthMode {
+    None = 0,
+    SharedSecretHmacSha256 = 1,
+}
+
+impl TryFrom<u8> for AuthMode {
+    type Error = LavaFlowError;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::None),
+            1 => Ok(Self::SharedSecretHmacSha256),
+            _ => Err(channel_protocol_error(
+                "decode_auth_mode",
+                "unknown authentication mode",
+            )),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -110,11 +204,17 @@ impl Default for ProtocolLimits {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct ConnectionHeader {
     encoding: MetadataEncoding,
+    access: Access,
+    auth_mode: AuthMode,
 }
 
 impl ConnectionHeader {
-    fn from_encoding(encoding: MetadataEncoding) -> Self {
-        Self { encoding }
+    fn from_bootstrap(encoding: MetadataEncoding, bootstrap: &BootstrapOptions) -> Self {
+        Self {
+            encoding,
+            access: bootstrap.access,
+            auth_mode: bootstrap.auth.auth_mode(),
+        }
     }
 
     fn write_to(self, transport: &mut platform::TransportSender) -> Result<()> {
@@ -122,6 +222,8 @@ impl ConnectionHeader {
             ProtocolTag::ConnectionHeader as u8,
             LOCAL_PROTOCOL_VERSION,
             self.encoding as u8,
+            self.access as u8,
+            self.auth_mode as u8,
         ])?;
         transport.flush()
     }
@@ -135,7 +237,7 @@ impl ConnectionHeader {
             ));
         }
 
-        let mut header = [0_u8; 2];
+        let mut header = [0_u8; 4];
         transport.read_exact(&mut header)?;
         if header[0] != LOCAL_PROTOCOL_VERSION {
             return Err(channel_protocol_error(
@@ -145,7 +247,13 @@ impl ConnectionHeader {
         }
 
         let encoding = MetadataEncoding::try_from(header[1])?;
-        Ok(Self { encoding })
+        let access = Access::try_from(header[2])?;
+        let auth_mode = AuthMode::try_from(header[3])?;
+        Ok(Self {
+            encoding,
+            access,
+            auth_mode,
+        })
     }
 }
 
@@ -156,6 +264,11 @@ enum ProtocolTag {
     MessageEnvelope = 2,
     ImportOk = 3,
     ImportFailed = 4,
+    ConnectionOk = 5,
+    AuthChallenge = 6,
+    AuthResponse = 7,
+    AuthOk = 8,
+    AuthFailed = 9,
 }
 
 impl TryFrom<u8> for ProtocolTag {
@@ -167,6 +280,11 @@ impl TryFrom<u8> for ProtocolTag {
             2 => Ok(Self::MessageEnvelope),
             3 => Ok(Self::ImportOk),
             4 => Ok(Self::ImportFailed),
+            5 => Ok(Self::ConnectionOk),
+            6 => Ok(Self::AuthChallenge),
+            7 => Ok(Self::AuthResponse),
+            8 => Ok(Self::AuthOk),
+            9 => Ok(Self::AuthFailed),
             _ => Err(channel_protocol_error(
                 "decode_protocol_tag",
                 "unknown protocol tag",
@@ -199,6 +317,247 @@ impl ProtocolTag {
             Err(_) => Err(channel_protocol_error(operation, "unknown protocol tag")),
         }
     }
+}
+
+#[cfg(feature = "rustcrypto-auth")]
+#[repr(u8)]
+#[derive(Copy, Clone)]
+enum EndpointRole {
+    Sender = 1,
+    Receiver = 2,
+}
+
+fn validate_expected_peer_process_id(expected: Option<u32>, actual: u32) -> Result<()> {
+    if let Some(expected) = expected
+        && actual != expected
+    {
+        return Err(authentication_failed(
+            "peer process id did not match expected value",
+        ));
+    }
+    Ok(())
+}
+
+fn authenticate_sender(
+    transport: &mut platform::TransportSender,
+    header: ConnectionHeader,
+    bootstrap: &BootstrapOptions,
+) -> Result<()> {
+    validate_expected_peer_process_id(
+        bootstrap.auth.expected_peer_process_id,
+        transport.peer_process_id()?,
+    )?;
+
+    match bootstrap.auth.secret()? {
+        None => {
+            let tag = ProtocolTag::read_from_sender(transport, "read_connection_ok")?;
+            match tag {
+                ProtocolTag::ConnectionOk => Ok(()),
+                ProtocolTag::AuthFailed => Err(authentication_failed("peer rejected bootstrap")),
+                _ => Err(channel_protocol_error(
+                    "read_connection_ok",
+                    "unexpected protocol tag",
+                )),
+            }
+        }
+        Some(secret) => {
+            #[cfg(feature = "rustcrypto-auth")]
+            {
+                authenticate_sender_with_secret(transport, header, bootstrap, secret)
+            }
+            #[cfg(not(feature = "rustcrypto-auth"))]
+            {
+                let _ = (header, bootstrap, secret);
+                Err(auth::unsupported_auth_error())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "rustcrypto-auth")]
+fn authenticate_sender_with_secret(
+    transport: &mut platform::TransportSender,
+    header: ConnectionHeader,
+    bootstrap: &BootstrapOptions,
+    secret: &SharedSecret,
+) -> Result<()> {
+    let tag = ProtocolTag::read_from_sender(transport, "read_auth_challenge")?;
+    match tag {
+        ProtocolTag::AuthChallenge => {}
+        ProtocolTag::AuthFailed => return Err(authentication_failed("peer rejected bootstrap")),
+        _ => {
+            return Err(channel_protocol_error(
+                "read_auth_challenge",
+                "unexpected protocol tag",
+            ));
+        }
+    }
+
+    let mut receiver_nonce = [0_u8; auth::NONCE_SIZE];
+    transport.read_exact(&mut receiver_nonce)?;
+    let sender_nonce = auth::random_nonce()?;
+    let sender_mac = auth::auth_tag(
+        secret,
+        &auth_transcript(
+            bootstrap,
+            EndpointRole::Sender,
+            header,
+            &sender_nonce,
+            &receiver_nonce,
+        ),
+    )?;
+
+    transport.write_all(&[ProtocolTag::AuthResponse as u8])?;
+    transport.write_all(&sender_nonce)?;
+    transport.write_all(&sender_mac)?;
+    transport.flush()?;
+
+    let tag = ProtocolTag::read_from_sender(transport, "read_auth_ok")?;
+    match tag {
+        ProtocolTag::AuthOk => {}
+        ProtocolTag::AuthFailed => return Err(authentication_failed("peer rejected bootstrap")),
+        _ => {
+            return Err(channel_protocol_error(
+                "read_auth_ok",
+                "unexpected protocol tag",
+            ));
+        }
+    }
+
+    let mut receiver_mac = [0_u8; auth::TAG_SIZE];
+    transport.read_exact(&mut receiver_mac)?;
+    auth::verify_auth_tag(
+        secret,
+        &auth_transcript(
+            bootstrap,
+            EndpointRole::Receiver,
+            header,
+            &sender_nonce,
+            &receiver_nonce,
+        ),
+        &receiver_mac,
+    )
+}
+
+fn authenticate_receiver(
+    transport: &mut platform::TransportReceiver,
+    header: ConnectionHeader,
+    bootstrap: &BootstrapOptions,
+) -> Result<()> {
+    let result = authenticate_receiver_inner(transport, header, bootstrap);
+    if result.is_err() {
+        let _ = transport.write_all(&[ProtocolTag::AuthFailed as u8]);
+        let _ = transport.flush();
+    }
+    result
+}
+
+fn authenticate_receiver_inner(
+    transport: &mut platform::TransportReceiver,
+    header: ConnectionHeader,
+    bootstrap: &BootstrapOptions,
+) -> Result<()> {
+    validate_expected_peer_process_id(
+        bootstrap.auth.expected_peer_process_id,
+        transport.peer_process_id()?,
+    )?;
+    let secret = bootstrap.auth.secret()?;
+    if header.access != bootstrap.access {
+        return Err(authentication_failed("local access policies do not match"));
+    }
+    if header.auth_mode != bootstrap.auth.auth_mode() {
+        return Err(authentication_failed("authentication modes do not match"));
+    }
+
+    match secret {
+        None => {
+            transport.write_all(&[ProtocolTag::ConnectionOk as u8])?;
+            transport.flush()
+        }
+        Some(secret) => {
+            #[cfg(feature = "rustcrypto-auth")]
+            {
+                authenticate_receiver_with_secret(transport, header, bootstrap, secret)
+            }
+            #[cfg(not(feature = "rustcrypto-auth"))]
+            {
+                let _ = (header, bootstrap, secret);
+                Err(auth::unsupported_auth_error())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "rustcrypto-auth")]
+fn authenticate_receiver_with_secret(
+    transport: &mut platform::TransportReceiver,
+    header: ConnectionHeader,
+    bootstrap: &BootstrapOptions,
+    secret: &SharedSecret,
+) -> Result<()> {
+    let receiver_nonce = auth::random_nonce()?;
+    transport.write_all(&[ProtocolTag::AuthChallenge as u8])?;
+    transport.write_all(&receiver_nonce)?;
+    transport.flush()?;
+
+    let tag = ProtocolTag::read_from_receiver(transport, "read_auth_response")?;
+    if tag != ProtocolTag::AuthResponse {
+        return Err(channel_protocol_error(
+            "read_auth_response",
+            "unexpected protocol tag",
+        ));
+    }
+    let mut sender_nonce = [0_u8; auth::NONCE_SIZE];
+    let mut sender_mac = [0_u8; auth::TAG_SIZE];
+    transport.read_exact(&mut sender_nonce)?;
+    transport.read_exact(&mut sender_mac)?;
+
+    auth::verify_auth_tag(
+        secret,
+        &auth_transcript(
+            bootstrap,
+            EndpointRole::Sender,
+            header,
+            &sender_nonce,
+            &receiver_nonce,
+        ),
+        &sender_mac,
+    )?;
+    let receiver_mac = auth::auth_tag(
+        secret,
+        &auth_transcript(
+            bootstrap,
+            EndpointRole::Receiver,
+            header,
+            &sender_nonce,
+            &receiver_nonce,
+        ),
+    )?;
+    transport.write_all(&[ProtocolTag::AuthOk as u8])?;
+    transport.write_all(&receiver_mac)?;
+    transport.flush()
+}
+
+#[cfg(feature = "rustcrypto-auth")]
+fn auth_transcript(
+    bootstrap: &BootstrapOptions,
+    endpoint_role: EndpointRole,
+    header: ConnectionHeader,
+    sender_nonce: &[u8; auth::NONCE_SIZE],
+    receiver_nonce: &[u8; auth::NONCE_SIZE],
+) -> Vec<u8> {
+    let mut transcript = Vec::new();
+    transcript.extend_from_slice(auth::TRANSCRIPT_DOMAIN);
+    transcript.push(LOCAL_PROTOCOL_VERSION);
+    transcript.push(header.encoding as u8);
+    transcript.push(header.access as u8);
+    transcript.push(header.auth_mode as u8);
+    transcript.push(bootstrap.access as u8);
+    transcript.push(endpoint_role as u8);
+    transcript.extend_from_slice(bootstrap.channel_id.as_str().as_bytes());
+    transcript.extend_from_slice(sender_nonce);
+    transcript.extend_from_slice(receiver_nonce);
+    transcript
 }
 
 #[repr(u8)]
@@ -327,12 +686,13 @@ impl Sender {
         encoding: MetadataEncoding,
         address: &EndpointAddress,
         limits: ProtocolLimits,
-        access: Access,
+        bootstrap: BootstrapOptions,
     ) -> Result<SenderListener> {
         Ok(SenderListener {
             encoding,
-            listener: platform::TransportListener::bind(address, access)?,
+            listener: platform::TransportListener::bind(address, bootstrap.access)?,
             limits,
+            bootstrap,
         })
     }
 
@@ -410,10 +770,10 @@ pub(crate) fn listen(
     channel_id: &ChannelId,
     encoding: MetadataEncoding,
     limits: ProtocolLimits,
-    access: Access,
+    bootstrap: BootstrapOptions,
 ) -> Result<SenderListener> {
-    let address = EndpointAddress::from_channel(channel_id, access);
-    Sender::listen(encoding, &address, limits, access)
+    let address = EndpointAddress::from_channel(channel_id, bootstrap.access);
+    Sender::listen(encoding, &address, limits, bootstrap)
 }
 
 #[derive(Debug)]
@@ -421,12 +781,15 @@ pub(crate) struct SenderListener {
     encoding: MetadataEncoding,
     listener: platform::TransportListener,
     limits: ProtocolLimits,
+    bootstrap: BootstrapOptions,
 }
 
 impl SenderListener {
     pub(crate) fn accept(self) -> Result<Sender> {
         let mut transport = self.listener.accept()?;
-        ConnectionHeader::from_encoding(self.encoding).write_to(&mut transport)?;
+        let header = ConnectionHeader::from_bootstrap(self.encoding, &self.bootstrap);
+        header.write_to(&mut transport)?;
+        authenticate_sender(&mut transport, header, &self.bootstrap)?;
         Ok(Sender::new(self.encoding, transport, self.limits))
     }
 
@@ -446,7 +809,9 @@ impl SenderListener {
 
             match self.listener.try_accept()? {
                 Some(mut transport) => {
-                    ConnectionHeader::from_encoding(self.encoding).write_to(&mut transport)?;
+                    let header = ConnectionHeader::from_bootstrap(self.encoding, &self.bootstrap);
+                    header.write_to(&mut transport)?;
+                    authenticate_sender(&mut transport, header, &self.bootstrap)?;
                     return Ok(Sender::new(self.encoding, transport, self.limits));
                 }
                 None => {
@@ -483,9 +848,14 @@ impl Receiver {
         }
     }
 
-    pub(crate) fn connect(address: &EndpointAddress, limits: ProtocolLimits) -> Result<Self> {
+    pub(crate) fn connect(
+        address: &EndpointAddress,
+        limits: ProtocolLimits,
+        bootstrap: BootstrapOptions,
+    ) -> Result<Self> {
         let mut transport = platform::TransportReceiver::connect(address)?;
         let header = ConnectionHeader::read_from(&mut transport)?;
+        authenticate_receiver(&mut transport, header, &bootstrap)?;
         Ok(Self::new(header.encoding, transport, limits))
     }
 
@@ -532,10 +902,10 @@ impl Receiver {
 pub(crate) fn connect(
     channel_id: &ChannelId,
     limits: ProtocolLimits,
-    access: Access,
+    bootstrap: BootstrapOptions,
 ) -> Result<Receiver> {
-    let address = EndpointAddress::from_channel(channel_id, access);
-    Receiver::connect(&address, limits)
+    let address = EndpointAddress::from_channel(channel_id, bootstrap.access);
+    Receiver::connect(&address, limits, bootstrap)
 }
 
 pub(crate) fn is_retryable_connect_error(err: &LavaFlowError) -> bool {
@@ -699,6 +1069,10 @@ fn channel_protocol_error(operation: &'static str, message: &'static str) -> Lav
     }
 }
 
+fn authentication_failed(reason: &'static str) -> LavaFlowError {
+    LavaFlowError::ChannelAuthenticationFailed { reason }
+}
+
 fn metadata_deserialize_error(source: serde_json::Error) -> LavaFlowError {
     LavaFlowError::ChannelMetadataCodec {
         operation: "deserialize_metadata",
@@ -768,19 +1142,28 @@ mod tests {
             platform::tests::support::test_address()
         }
 
+        pub(in crate::channel::local) fn test_bootstrap_options() -> BootstrapOptions {
+            BootstrapOptions::new(
+                ChannelId::new("local-test-channel").expect("channel id"),
+                Access::CurrentSession,
+                AuthOptions::default(),
+            )
+        }
+
         pub(in crate::channel::local) fn test_pair(
             encoding: MetadataEncoding,
         ) -> Result<(Sender, Receiver)> {
             let address = test_address();
+            let bootstrap = test_bootstrap_options();
             let listener = Sender::listen(
                 encoding,
                 &address,
                 ProtocolLimits::default(),
-                Access::CurrentSession,
+                bootstrap.clone(),
             )?;
             let receiver_address = address.clone();
             let receiver_thread = thread::spawn(move || {
-                Receiver::connect(&receiver_address, ProtocolLimits::default())
+                Receiver::connect(&receiver_address, ProtocolLimits::default(), bootstrap)
             });
             let sender = listener.accept()?;
             let receiver = receiver_thread
@@ -815,6 +1198,20 @@ mod tests {
 
     const SMALL_PAYLOAD_LIMIT: usize = BUFFER_SIZE - 1;
     const SMALL_METADATA_LIMIT: usize = 8;
+    #[cfg(feature = "rustcrypto-auth")]
+    const TEST_SHARED_SECRET: &[u8] = b"local auth coverage shared secret";
+
+    fn test_auth_bootstrap(secret: Option<&[u8]>) -> BootstrapOptions {
+        let auth = match secret {
+            Some(secret) => AuthOptions::default().with_shared_secret(secret.to_vec()),
+            None => AuthOptions::default(),
+        };
+        BootstrapOptions::new(
+            ChannelId::new("local-auth-test-channel").expect("channel id"),
+            Access::CurrentSession,
+            auth,
+        )
+    }
 
     #[test]
     fn cpu_local_ipc_round_trips_typed_metadata_and_shared_payload() {
@@ -1023,13 +1420,100 @@ mod tests {
     }
 
     #[test]
+    fn auth_options_reject_empty_shared_secret() {
+        let auth = AuthOptions::default().with_shared_secret(Vec::new());
+        let err = auth
+            .secret()
+            .expect_err("empty shared secret must be rejected");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelAuthenticationFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn shared_secret_debug_redacts_secret_bytes() {
+        let secret = SharedSecret::from_test_secret(b"local auth coverage shared secret".to_vec());
+        let debug = format!("{secret:?}");
+
+        assert_eq!(debug, "SharedSecret(\"<redacted>\")");
+        assert!(!debug.contains("coverage"));
+    }
+
+    #[test]
+    fn auth_options_can_return_constructed_secret() {
+        let auth = AuthOptions {
+            shared_secret: Some(Ok(SharedSecret::from_test_secret(
+                b"constructed test secret".to_vec(),
+            ))),
+            expected_peer_process_id: None,
+        };
+
+        assert!(auth.secret().expect("secret must decode").is_some());
+    }
+
+    #[test]
+    fn protocol_tag_decodes_auth_control_tags() {
+        assert_eq!(
+            ProtocolTag::try_from(ProtocolTag::AuthChallenge as u8).expect("auth challenge tag"),
+            ProtocolTag::AuthChallenge,
+        );
+        assert_eq!(
+            ProtocolTag::try_from(ProtocolTag::AuthResponse as u8).expect("auth response tag"),
+            ProtocolTag::AuthResponse,
+        );
+        assert_eq!(
+            ProtocolTag::try_from(ProtocolTag::AuthOk as u8).expect("auth ok tag"),
+            ProtocolTag::AuthOk,
+        );
+        assert_eq!(
+            ProtocolTag::try_from(ProtocolTag::AuthFailed as u8).expect("auth failed tag"),
+            ProtocolTag::AuthFailed,
+        );
+    }
+
+    #[test]
+    fn expected_peer_process_id_rejects_mismatch() {
+        let err = validate_expected_peer_process_id(Some(11), 12)
+            .expect_err("mismatched peer pid must fail");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelAuthenticationFailed { .. }
+        ));
+    }
+
+    #[cfg(not(feature = "rustcrypto-auth"))]
+    #[test]
+    fn rustcrypto_auth_helpers_report_unsupported_when_feature_is_disabled() {
+        let secret = SharedSecret::from_test_secret(Vec::new());
+
+        let nonce_err = auth::random_nonce()
+            .expect_err("nonce generation must require rustcrypto-auth feature");
+        let tag_err = auth::auth_tag(&secret, b"transcript")
+            .expect_err("auth tag must require rustcrypto-auth feature");
+        let verify_err = auth::verify_auth_tag(&secret, b"transcript", &[0_u8; auth::TAG_SIZE])
+            .expect_err("auth tag verification must require rustcrypto-auth feature");
+
+        for err in [nonce_err, tag_err, verify_err] {
+            assert!(matches!(
+                err,
+                LavaFlowError::UnsupportedChannelAuthentication {
+                    mechanism: "shared-secret-hmac-sha256"
+                }
+            ));
+        }
+    }
+
+    #[test]
     fn receiver_rejects_unsupported_protocol_version() {
         let address = support::test_address();
         let listener = platform::TransportListener::bind(&address, Access::CurrentSession)
             .expect("bind transport");
         let receiver_address = address.clone();
-        let receiver_thread =
-            thread::spawn(move || Receiver::connect(&receiver_address, ProtocolLimits::default()));
+        let bootstrap = support::test_bootstrap_options();
+        let receiver_thread = thread::spawn(move || {
+            Receiver::connect(&receiver_address, ProtocolLimits::default(), bootstrap)
+        });
 
         let mut sender_transport = listener.accept().expect("accept transport");
         sender_transport
@@ -1037,6 +1521,8 @@ mod tests {
                 ProtocolTag::ConnectionHeader as u8,
                 LOCAL_PROTOCOL_VERSION + 1,
                 MetadataEncoding::Json as u8,
+                Access::CurrentSession as u8,
+                AuthMode::None as u8,
             ])
             .expect("write invalid connection header");
         sender_transport.flush().expect("flush invalid header");
@@ -1049,6 +1535,216 @@ mod tests {
             err,
             LavaFlowError::ChannelTransportOperation {
                 operation: "read_connection_header",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn receiver_rejects_unknown_auth_mode_in_connection_header() {
+        let (mut sender_transport, mut receiver_transport) =
+            test_transport_pair().expect("create transport pair");
+        sender_transport
+            .write_all(&[
+                ProtocolTag::ConnectionHeader as u8,
+                LOCAL_PROTOCOL_VERSION,
+                MetadataEncoding::Json as u8,
+                Access::CurrentSession as u8,
+                99,
+            ])
+            .expect("write invalid connection header");
+        sender_transport
+            .flush()
+            .expect("flush invalid connection header");
+
+        let err = ConnectionHeader::read_from(&mut receiver_transport)
+            .expect_err("receiver must reject unknown authentication mode");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "decode_auth_mode",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn sender_rejects_unexpected_connection_ack_tag() {
+        let (mut sender_transport, mut receiver_transport) =
+            test_transport_pair().expect("create transport pair");
+        receiver_transport
+            .write_all(&[ProtocolTag::MessageEnvelope as u8])
+            .expect("write unexpected connection ack tag");
+        receiver_transport
+            .flush()
+            .expect("flush unexpected connection ack tag");
+        let bootstrap = test_auth_bootstrap(None);
+        let header = ConnectionHeader::from_bootstrap(MetadataEncoding::Json, &bootstrap);
+
+        let err = authenticate_sender(&mut sender_transport, header, &bootstrap)
+            .expect_err("sender must reject unexpected connection ack tag");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "read_connection_ok",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn sender_reports_auth_failed_connection_ack() {
+        let (mut sender_transport, mut receiver_transport) =
+            test_transport_pair().expect("create transport pair");
+        receiver_transport
+            .write_all(&[ProtocolTag::AuthFailed as u8])
+            .expect("write auth failed tag");
+        receiver_transport.flush().expect("flush auth failed tag");
+        let bootstrap = test_auth_bootstrap(None);
+        let header = ConnectionHeader::from_bootstrap(MetadataEncoding::Json, &bootstrap);
+
+        let err = authenticate_sender(&mut sender_transport, header, &bootstrap)
+            .expect_err("sender must report auth failure from receiver");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelAuthenticationFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn sender_rejects_unknown_protocol_tag_when_reading_control_reply() {
+        let (mut sender_transport, mut receiver_transport) =
+            test_transport_pair().expect("create transport pair");
+        receiver_transport
+            .write_all(&[99])
+            .expect("write unknown protocol tag");
+        receiver_transport
+            .flush()
+            .expect("flush unknown protocol tag");
+
+        let err = ProtocolTag::read_from_sender(&mut sender_transport, "read_test_control")
+            .expect_err("sender must reject unknown protocol tag");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "read_test_control",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn receiver_rejects_access_policy_mismatch() {
+        let (_sender_transport, mut receiver_transport) =
+            test_transport_pair().expect("create transport pair");
+        let bootstrap = test_auth_bootstrap(None);
+        let header = ConnectionHeader {
+            encoding: MetadataEncoding::Json,
+            access: Access::AuthenticatedUsers,
+            auth_mode: AuthMode::None,
+        };
+
+        let err = authenticate_receiver(&mut receiver_transport, header, &bootstrap)
+            .expect_err("receiver must reject mismatched local access policy");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelAuthenticationFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn receiver_rejects_auth_mode_mismatch() {
+        let (_sender_transport, mut receiver_transport) =
+            test_transport_pair().expect("create transport pair");
+        let bootstrap = test_auth_bootstrap(None);
+        let header = ConnectionHeader {
+            encoding: MetadataEncoding::Json,
+            access: Access::CurrentSession,
+            auth_mode: AuthMode::SharedSecretHmacSha256,
+        };
+
+        let err = authenticate_receiver(&mut receiver_transport, header, &bootstrap)
+            .expect_err("receiver must reject mismatched auth mode");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelAuthenticationFailed { .. }
+        ));
+    }
+
+    #[cfg(feature = "rustcrypto-auth")]
+    #[test]
+    fn sender_rejects_unexpected_auth_challenge_tag() {
+        let (mut sender_transport, mut receiver_transport) =
+            test_transport_pair().expect("create transport pair");
+        receiver_transport
+            .write_all(&[ProtocolTag::ConnectionOk as u8])
+            .expect("write unexpected auth challenge tag");
+        receiver_transport
+            .flush()
+            .expect("flush unexpected auth challenge tag");
+        let bootstrap = test_auth_bootstrap(Some(TEST_SHARED_SECRET));
+        let header = ConnectionHeader::from_bootstrap(MetadataEncoding::Json, &bootstrap);
+
+        let err = authenticate_sender(&mut sender_transport, header, &bootstrap)
+            .expect_err("sender must reject unexpected auth challenge tag");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "read_auth_challenge",
+                ..
+            }
+        ));
+    }
+
+    #[cfg(feature = "rustcrypto-auth")]
+    #[test]
+    fn sender_rejects_unexpected_auth_ok_tag() {
+        let (mut sender_transport, mut receiver_transport) =
+            test_transport_pair().expect("create transport pair");
+        receiver_transport
+            .write_all(&[ProtocolTag::AuthChallenge as u8])
+            .expect("write auth challenge tag");
+        receiver_transport
+            .write_all(&[0x5a; auth::NONCE_SIZE])
+            .expect("write receiver nonce");
+        receiver_transport
+            .write_all(&[ProtocolTag::ConnectionOk as u8])
+            .expect("write unexpected auth ok tag");
+        receiver_transport.flush().expect("flush auth challenge");
+        let bootstrap = test_auth_bootstrap(Some(TEST_SHARED_SECRET));
+        let header = ConnectionHeader::from_bootstrap(MetadataEncoding::Json, &bootstrap);
+
+        let err = authenticate_sender(&mut sender_transport, header, &bootstrap)
+            .expect_err("sender must reject unexpected auth ok tag");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "read_auth_ok",
+                ..
+            }
+        ));
+    }
+
+    #[cfg(feature = "rustcrypto-auth")]
+    #[test]
+    fn receiver_rejects_unexpected_auth_response_tag() {
+        let (mut sender_transport, mut receiver_transport) =
+            test_transport_pair().expect("create transport pair");
+        sender_transport
+            .write_all(&[ProtocolTag::ConnectionOk as u8])
+            .expect("write unexpected auth response tag");
+        sender_transport
+            .flush()
+            .expect("flush unexpected auth response tag");
+        let bootstrap = test_auth_bootstrap(Some(TEST_SHARED_SECRET));
+        let header = ConnectionHeader::from_bootstrap(MetadataEncoding::Json, &bootstrap);
+
+        let err = authenticate_receiver(&mut receiver_transport, header, &bootstrap)
+            .expect_err("receiver must reject unexpected auth response tag");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "read_auth_response",
                 ..
             }
         ));
@@ -1083,6 +1779,8 @@ mod tests {
                 ProtocolTag::ConnectionHeader as u8,
                 LOCAL_PROTOCOL_VERSION,
                 99,
+                Access::CurrentSession as u8,
+                AuthMode::None as u8,
             ])
             .expect("write invalid connection header");
         sender_transport
@@ -1095,6 +1793,34 @@ mod tests {
             err,
             LavaFlowError::ChannelTransportOperation {
                 operation: "decode_connection_header",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn receiver_rejects_unknown_local_access_in_connection_header() {
+        let (mut sender_transport, mut receiver_transport) =
+            test_transport_pair().expect("create transport pair");
+        sender_transport
+            .write_all(&[
+                ProtocolTag::ConnectionHeader as u8,
+                LOCAL_PROTOCOL_VERSION,
+                MetadataEncoding::Json as u8,
+                99,
+                AuthMode::None as u8,
+            ])
+            .expect("write invalid connection header");
+        sender_transport
+            .flush()
+            .expect("flush invalid connection header");
+
+        let err = ConnectionHeader::read_from(&mut receiver_transport)
+            .expect_err("receiver must reject unknown local access policy");
+        assert!(matches!(
+            err,
+            LavaFlowError::ChannelTransportOperation {
+                operation: "decode_local_access",
                 ..
             }
         ));
@@ -1584,10 +2310,6 @@ mod tests {
             receiver_transport,
             ProtocolLimits::default(),
         );
-        let buffer = test_allocator()
-            .allocate(BUFFER_SIZE)
-            .expect("allocate payload");
-        let handle = buffer.shared_handle().expect("export shared handle");
         let metadata = serde_json::to_vec(&TestMeta {
             width: 8,
             height: 8,
@@ -1601,11 +2323,8 @@ mod tests {
             .write_all(&(BUFFER_SIZE as u64).to_le_bytes())
             .expect("write payload size");
         sender_transport
-            .send_handle(handle)
-            .expect("send cpu handle");
-        // Close the transferred handle before the receiver imports it so recv() exercises the
-        // ImportFailed path instead of failing earlier at envelope parsing time.
-        sender_transport.abort_transfer();
+            .write_all(&0x1234_u64.to_le_bytes())
+            .expect("write invalid non-null handle value");
         sender_transport
             .write_all(&(metadata.len() as u32).to_le_bytes())
             .expect("write metadata length");
@@ -1616,7 +2335,7 @@ mod tests {
 
         let err = receiver
             .recv::<TestMeta>()
-            .expect_err("receiver must fail when transferred cpu handle is closed");
+            .expect_err("receiver must fail when transferred cpu handle is invalid");
         assert!(matches!(err, LavaFlowError::SharedMemoryOperation { .. }));
 
         let ack = ProtocolTag::read_from_sender(&mut sender_transport, "read_import_ack")
@@ -1634,10 +2353,6 @@ mod tests {
             receiver_transport,
             ProtocolLimits::default(),
         );
-        let buffer = test_allocator()
-            .allocate(BUFFER_SIZE)
-            .expect("allocate payload");
-        let handle = buffer.shared_handle().expect("export shared handle");
         let metadata = serde_json::to_vec(&MessageMeta {
             values: BTreeMap::new(),
         })
@@ -1650,9 +2365,8 @@ mod tests {
             .write_all(&(BUFFER_SIZE as u64).to_le_bytes())
             .expect("write payload size");
         sender_transport
-            .send_handle(handle)
-            .expect("send cpu handle");
-        sender_transport.abort_transfer();
+            .write_all(&0x1234_u64.to_le_bytes())
+            .expect("write invalid non-null handle value");
         sender_transport
             .write_all(&(metadata.len() as u32).to_le_bytes())
             .expect("write metadata length");
@@ -1663,7 +2377,7 @@ mod tests {
 
         let err = receiver
             .recv_map()
-            .expect_err("receiver must fail when transferred cpu handle is closed");
+            .expect_err("receiver must fail when transferred cpu handle is invalid");
         assert!(matches!(err, LavaFlowError::SharedMemoryOperation { .. }));
 
         let ack = ProtocolTag::read_from_sender(&mut sender_transport, "read_import_ack")

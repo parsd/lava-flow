@@ -6,7 +6,13 @@ These instructions apply to coding agents when modifying this repository.
 
 1. **Format first:** run `cargo fmt`.
 2. **Lint next:** run `cargo clippy` and fix all warnings.
+   - Run both feature modes:
+     - `cargo clippy --all-targets --all-features -- -D warnings`
+     - `cargo clippy --all-targets --no-default-features -- -D warnings`
 3. **Test last:** run tests for the affected component(s) and any components that depend on them.
+   - Run both feature modes:
+     - `cargo test --all-targets --all-features`
+     - `cargo test --all-targets --no-default-features`
 
 If any step cannot be run, explain why and what would be required to run it.
 
@@ -21,6 +27,10 @@ If any step cannot be run, explain why and what would be required to run it.
 - If a change conflicts with a spec/ADR, update the document and highlight that adjustment in your output
   or call out the mismatch.
 - For reusable validation/error reasons, prefer shared enums over local string constants.
+- Keep production code free of test-only behavior when possible. Put test-specific setup, naming, and isolation in
+  test modules, test support helpers, or test call sites rather than hiding it behind `#[cfg(test)]` in production paths.
+- Prefer moving conditional implementations into dedicated `cfg`-selected files/modules when a condition needs more than
+  one or two `#[cfg(...)]` sites in the same production module.
 
 ## Documentation Standards
 
@@ -30,8 +40,21 @@ If any step cannot be run, explain why and what would be required to run it.
 ## Coverage Standards
 
 - Strive for 100% line and function coverage for core logic.
+- Coverage should be evaluated in both feature modes when feasible:
+  - `cargo llvm-cov --workspace --all-features`
+  - `cargo llvm-cov --workspace --no-default-features`
 - Region coverage may be lower due to compiler/instrumentation granularity; treat it as a guidance metric, not a hard gate.
 - Windows and WSL coverage must keep separate CARGO_TARGET_DIRs. Mixed target directories will corrupt the report inputs.
+- Keep all-features and no-default-features coverage target directories separate unless using an explicit
+  cargo-llvm-cov merge workflow.
+- To merge coverage across feature modes on the same platform, use one platform-specific target directory and
+  an explicit clean/no-report/no-clean/report sequence:
+  - `cargo llvm-cov clean --workspace`
+  - `cargo llvm-cov --workspace --all-features --no-report`
+  - `cargo llvm-cov --workspace --no-default-features --no-report --no-clean`
+  - `cargo llvm-cov report --summary-only`
+- Do not merge Windows and WSL coverage artifacts. Run the merge flow separately for each platform with
+  distinct `CARGO_TARGET_DIR` values.
 
 ## License Policy
 

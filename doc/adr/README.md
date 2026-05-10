@@ -30,3 +30,4 @@ When to references ADRs:
 | [015](015-rust-vulkan-binding-library.md) | Rust Vulkan Binding Library Selection | Accepted | Layer 1 GPU implementation dependency |
 | [016](016-github-actions-third-party-action-pinning.md) | GitHub Actions Third-Party Action Pinning | Accepted | CI dependency immutability |
 | [017](017-github-actions-vulkan-ci-setup.md) | GitHub Actions Vulkan CI Setup | Accepted | CI software Vulkan enablement on hosted runners |
+| [018](018-rustcrypto-local-ipc-authentication.md) | RustCrypto for Local IPC Bootstrap Authentication | Accepted | Local IPC bootstrap security |

@@ -219,15 +219,19 @@ Current builder surface:
   - local access convenience methods:
     - `with_current_session_local_access()` for the default current logon session / Unix user policy
     - `with_authenticated_users_local_access()` for explicitly shared local IPC between local users
-  - local maximum payload size
-  - local maximum metadata size
+  - maximum payload size via `with_max_payload_size(...)`
+  - maximum metadata size via `with_max_metadata_size(...)`
+  - optional shared-secret bootstrap authentication via `with_shared_secret(...)`
+  - optional expected peer process-id validation via `with_expected_peer_process_id(...)`
   - optional `build_with_timeout(timeout)` for bounded waits while accepting a receiver
   - optional cancellation via `BuildCancel`, `build_or_cancelled(...)`, and
     `build_with_timeout_or_cancel(...)`
 - receiver builder currently exposes:
   - the same local access convenience methods as the sender builder
-  - local maximum payload size
-  - local maximum metadata size
+  - maximum payload size via `with_max_payload_size(...)`
+  - maximum metadata size via `with_max_metadata_size(...)`
+  - optional shared-secret bootstrap authentication via `with_shared_secret(...)`
+  - optional expected peer process-id validation via `with_expected_peer_process_id(...)`
   - optional `build_with_timeout(timeout)` for startup-tolerant local connects
   - optional cancellation via `BuildCancel`, `build_or_cancelled(...)`, and
     `build_with_timeout_or_cancel(...)`
@@ -247,6 +251,22 @@ Local envelope size limits:
 
 Phase 3 local security is transport-specific and currently implemented as follows.
 
+Common local bootstrap:
+
+- local IPC uses an explicit connection header with protocol version, metadata encoding, local
+  access policy, and authentication mode
+- unauthenticated peers still exchange a connection acknowledgement so auth-mode mismatches fail
+  during `build()`
+- `with_shared_secret(...)` enables HMAC-SHA-256 challenge/response with 32-byte OS-random nonces
+- both peers must configure shared-secret authentication the same way; a missing or different
+  secret fails the bootstrap before any message envelope or handle transfer
+- the HMAC transcript includes the local protocol domain, protocol version, metadata encoding,
+  access policy, `ChannelId`, both nonces, and the authenticated endpoint role
+- `with_expected_peer_process_id(...)` enables optional peer PID validation for orchestrated local
+  IPC; this is defense-in-depth and does not replace shared-secret authentication
+- RustCrypto dependencies for shared-secret auth are controlled by the default `rustcrypto-auth`
+  feature; see [ADR-018](../adr/018-rustcrypto-local-ipc-authentication.md)
+
 Windows:
 
 - local IPC uses one duplex named pipe for bootstrap, envelopes, CPU/GPU handle transfer, and
@@ -256,6 +276,7 @@ Windows:
 - the authenticated-users local access policy grants access to the Windows Authenticated Users SID;
   it does not use the broader Everyone SID
 - the granted access mask is aligned with the actual duplex client open mode used by the transport
+- expected peer PID validation uses named-pipe peer process-id APIs
 
 Unix:
 
@@ -273,9 +294,7 @@ Unix:
 - the authenticated-users local access policy uses a socket path directly under the system
   temporary directory and sets the socket mode to `0666` (`rw-rw-rw-`); the parent directory must be
   sticky and writable by other users
-
-These measures reduce cross-user access to local IPC endpoints before the later shared-secret
-challenge/response hardening is added.
+- on Linux, expected peer PID validation uses connected-socket peer credentials
 
 ### Point-To-Point First
 

@@ -29,7 +29,7 @@ impl Builder {
         peer_location: ProcessLocation,
     ) -> SenderBuilder {
         SenderBuilder {
-            options: BuilderOptions::new(channel_id, detect_scope(&my_location, &peer_location)),
+            options: BuilderOptions::new(channel_id, my_location, peer_location),
             metadata_encoding: MetadataEncoding::default(),
         }
     }
@@ -41,7 +41,7 @@ impl Builder {
         peer_location: ProcessLocation,
     ) -> ReceiverBuilder {
         ReceiverBuilder {
-            options: BuilderOptions::new(channel_id, detect_scope(&my_location, &peer_location)),
+            options: BuilderOptions::new(channel_id, my_location, peer_location),
         }
     }
 
@@ -88,29 +88,36 @@ impl BuildCancel {
 struct BuilderOptions {
     channel_id: ChannelId,
     scope: CommunicationScope,
-    local_max_payload_size: usize,
-    local_max_metadata_size: usize,
+    max_payload_size: usize,
+    max_metadata_size: usize,
     local_access: local::Access,
+    local_auth: local::AuthOptions,
 }
 
 impl BuilderOptions {
-    fn new(channel_id: ChannelId, scope: CommunicationScope) -> Self {
+    fn new(
+        channel_id: ChannelId,
+        my_location: ProcessLocation,
+        peer_location: ProcessLocation,
+    ) -> Self {
+        let scope = detect_scope(&my_location, &peer_location);
         Self {
             channel_id,
             scope,
-            local_max_payload_size: 0,
-            local_max_metadata_size: 0,
+            max_payload_size: 0,
+            max_metadata_size: 0,
             local_access: local::Access::default(),
+            local_auth: local::AuthOptions::default(),
         }
     }
 
-    fn with_local_max_payload_size(mut self, max_payload_size: usize) -> Self {
-        self.local_max_payload_size = max_payload_size;
+    fn with_max_payload_size(mut self, max_payload_size: usize) -> Self {
+        self.max_payload_size = max_payload_size;
         self
     }
 
-    fn with_local_max_metadata_size(mut self, max_metadata_size: usize) -> Self {
-        self.local_max_metadata_size = max_metadata_size;
+    fn with_max_metadata_size(mut self, max_metadata_size: usize) -> Self {
+        self.max_metadata_size = max_metadata_size;
         self
     }
 
@@ -119,15 +126,26 @@ impl BuilderOptions {
         self
     }
 
-    fn local_limits(&self) -> local::ProtocolLimits {
-        local::ProtocolLimits::with_max_sizes(
-            self.local_max_payload_size,
-            self.local_max_metadata_size,
-        )
+    fn with_shared_secret(mut self, secret: impl Into<Vec<u8>>) -> Self {
+        self.local_auth = self.local_auth.with_shared_secret(secret.into());
+        self
     }
 
-    fn local_access(&self) -> local::Access {
-        self.local_access
+    fn with_expected_peer_process_id(mut self, process_id: u32) -> Self {
+        self.local_auth = self.local_auth.with_expected_peer_process_id(process_id);
+        self
+    }
+
+    fn local_limits(&self) -> local::ProtocolLimits {
+        local::ProtocolLimits::with_max_sizes(self.max_payload_size, self.max_metadata_size)
+    }
+
+    fn local_bootstrap(&self) -> local::BootstrapOptions {
+        local::BootstrapOptions::new(
+            self.channel_id.clone(),
+            self.local_access,
+            self.local_auth.clone(),
+        )
     }
 }
 
@@ -147,19 +165,19 @@ impl SenderBuilder {
         self
     }
 
-    /// Overrides the local maximum payload size in bytes.
+    /// Overrides the maximum payload size in bytes.
     ///
     /// A value of `0` keeps the built-in default.
-    pub fn with_local_max_payload_size(mut self, max_payload_size: usize) -> Self {
-        self.options = self.options.with_local_max_payload_size(max_payload_size);
+    pub fn with_max_payload_size(mut self, max_payload_size: usize) -> Self {
+        self.options = self.options.with_max_payload_size(max_payload_size);
         self
     }
 
-    /// Overrides the local maximum metadata size in bytes.
+    /// Overrides the maximum metadata size in bytes.
     ///
     /// A value of `0` keeps the built-in default.
-    pub fn with_local_max_metadata_size(mut self, max_metadata_size: usize) -> Self {
-        self.options = self.options.with_local_max_metadata_size(max_metadata_size);
+    pub fn with_max_metadata_size(mut self, max_metadata_size: usize) -> Self {
+        self.options = self.options.with_max_metadata_size(max_metadata_size);
         self
     }
 
@@ -180,6 +198,25 @@ impl SenderBuilder {
         self.options = self
             .options
             .with_local_access(local::Access::AuthenticatedUsers);
+        self
+    }
+
+    /// Enables shared-secret bootstrap authentication for local IPC.
+    ///
+    /// Both peers must configure the same shared secret. Authentication completes before endpoint
+    /// construction returns and before any message or handle transfer can occur.
+    pub fn with_shared_secret(mut self, secret: impl Into<Vec<u8>>) -> Self {
+        self.options = self.options.with_shared_secret(secret);
+        self
+    }
+
+    /// Requires the connected local peer to have the expected OS process id.
+    ///
+    /// This is a defense-in-depth pre-authentication filter for orchestrated local IPC. PIDs are
+    /// app-supplied and ephemeral, so shared-secret authentication remains the primary peer
+    /// authentication mechanism.
+    pub fn with_expected_peer_process_id(mut self, process_id: u32) -> Self {
+        self.options = self.options.with_expected_peer_process_id(process_id);
         self
     }
 
@@ -223,7 +260,7 @@ impl SenderBuilder {
                     &self.options.channel_id,
                     self.metadata_encoding,
                     limits,
-                    self.options.local_access(),
+                    self.options.local_bootstrap(),
                 )?;
                 let inner = match (timeout, cancel) {
                     (None, None) => listener.accept()?,
@@ -252,19 +289,19 @@ pub struct ReceiverBuilder {
 impl ReceiverBuilder {
     const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
-    /// Overrides the local maximum payload size in bytes.
+    /// Overrides the maximum payload size in bytes.
     ///
     /// A value of `0` keeps the built-in default.
-    pub fn with_local_max_payload_size(mut self, max_payload_size: usize) -> Self {
-        self.options = self.options.with_local_max_payload_size(max_payload_size);
+    pub fn with_max_payload_size(mut self, max_payload_size: usize) -> Self {
+        self.options = self.options.with_max_payload_size(max_payload_size);
         self
     }
 
-    /// Overrides the local maximum metadata size in bytes.
+    /// Overrides the maximum metadata size in bytes.
     ///
     /// A value of `0` keeps the built-in default.
-    pub fn with_local_max_metadata_size(mut self, max_metadata_size: usize) -> Self {
-        self.options = self.options.with_local_max_metadata_size(max_metadata_size);
+    pub fn with_max_metadata_size(mut self, max_metadata_size: usize) -> Self {
+        self.options = self.options.with_max_metadata_size(max_metadata_size);
         self
     }
 
@@ -285,6 +322,25 @@ impl ReceiverBuilder {
         self.options = self
             .options
             .with_local_access(local::Access::AuthenticatedUsers);
+        self
+    }
+
+    /// Enables shared-secret bootstrap authentication for local IPC.
+    ///
+    /// Both peers must configure the same shared secret. Authentication completes before endpoint
+    /// construction returns and before any message or handle transfer can occur.
+    pub fn with_shared_secret(mut self, secret: impl Into<Vec<u8>>) -> Self {
+        self.options = self.options.with_shared_secret(secret);
+        self
+    }
+
+    /// Requires the connected local peer to have the expected OS process id.
+    ///
+    /// This is a defense-in-depth pre-authentication filter for orchestrated local IPC. PIDs are
+    /// app-supplied and ephemeral, so shared-secret authentication remains the primary peer
+    /// authentication mechanism.
+    pub fn with_expected_peer_process_id(mut self, process_id: u32) -> Self {
+        self.options = self.options.with_expected_peer_process_id(process_id);
         self
     }
 
@@ -330,7 +386,7 @@ impl ReceiverBuilder {
                     (None, None) => local::connect(
                         &self.options.channel_id,
                         limits,
-                        self.options.local_access(),
+                        self.options.local_bootstrap(),
                     )?,
                     (timeout, cancel) => {
                         self.connect_local_with_control(limits, timeout, cancel)?
@@ -362,7 +418,7 @@ impl ReceiverBuilder {
             match local::connect(
                 &self.options.channel_id,
                 limits,
-                self.options.local_access(),
+                self.options.local_bootstrap(),
             ) {
                 Ok(receiver) => return Ok(receiver),
                 Err(err) if local::is_retryable_connect_error(&err) => {
@@ -610,6 +666,10 @@ mod tests {
     static CHANNEL_TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
     const TEST_RECEIVER_BUILD_TIMEOUT: Duration = Duration::from_secs(5);
 
+    fn test_channel_id(prefix: &str, id: u64) -> ChannelId {
+        ChannelId::new(format!("{prefix}-{}-{id}", std::process::id())).expect("channel id")
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct PublicTestMeta {
         width: u32,
@@ -630,8 +690,8 @@ mod tests {
                 ProcessLocation::new("node-0").expect("sender location"),
             )
             .with_current_session_local_access()
-            .with_local_max_payload_size(max_payload)
-            .with_local_max_metadata_size(max_metadata)
+            .with_max_payload_size(max_payload)
+            .with_max_metadata_size(max_metadata)
             .build()
             {
                 Ok(receiver) => return receiver,
@@ -724,8 +784,7 @@ mod tests {
     fn local_builder_sender_and_receiver_round_trip_typed_metadata() {
         let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let _runtime_guard = local::stable_test_runtime_dir_guard("round-trip-typed", id);
-        let channel_id =
-            ChannelId::new(format!("builder-local-round-trip-{id}")).expect("channel id");
+        let channel_id = test_channel_id("builder-local-round-trip", id);
         let receiver_channel_id = channel_id.clone();
         let receiver_thread = thread::spawn(move || {
             let mut receiver = build_local_receiver_with_timeout(receiver_channel_id, 0);
@@ -768,8 +827,7 @@ mod tests {
     fn local_builder_public_typed_send_and_recv_round_trip() {
         let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let _runtime_guard = local::stable_test_runtime_dir_guard("public-typed", id);
-        let channel_id =
-            ChannelId::new(format!("builder-local-typed-round-trip-{id}")).expect("channel id");
+        let channel_id = test_channel_id("builder-local-typed-round-trip", id);
         let receiver_channel_id = channel_id.clone();
         let expected = PublicTestMeta {
             width: 800,
@@ -805,6 +863,341 @@ mod tests {
         assert_eq!(receiver_scope, CommunicationScope::Local);
     }
 
+    #[cfg(feature = "rustcrypto-auth")]
+    #[test]
+    fn local_builder_shared_secret_auth_round_trips() {
+        let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let _runtime_guard = local::stable_test_runtime_dir_guard("shared-secret-ok", id);
+        let channel_id = test_channel_id("builder-shared-secret-ok", id);
+        let receiver_channel_id = channel_id.clone();
+        let secret = b"shared local ipc test secret".to_vec();
+        let receiver_secret = secret.clone();
+        let expected = PublicTestMeta {
+            width: 1024,
+            height: 768,
+        };
+        let receiver_thread = thread::spawn(move || {
+            let mut receiver = Builder::receiver(
+                receiver_channel_id,
+                ProcessLocation::new("node-0").expect("receiver location"),
+                ProcessLocation::new("node-0").expect("sender location"),
+            )
+            .with_shared_secret(receiver_secret)
+            .build_with_timeout(Duration::from_secs(2))
+            .expect("build authenticated receiver");
+            let (frame, metadata) = receiver
+                .recv::<PublicTestMeta>()
+                .expect("receive authenticated message");
+            assert!(matches!(frame, Frame::Cpu(_)));
+            metadata
+        });
+
+        let mut sender = Builder::sender(
+            channel_id,
+            ProcessLocation::new("node-0").expect("sender location"),
+            ProcessLocation::new("node-0").expect("receiver location"),
+        )
+        .with_metadata_encoding(MetadataEncoding::Json)
+        .with_shared_secret(secret)
+        .build_with_timeout(Duration::from_secs(2))
+        .expect("build authenticated sender");
+        let buffer = cpu::Allocator::with_max_allocation_size(usize::MAX)
+            .allocate(64)
+            .expect("allocate payload");
+        sender
+            .send(buffer, &expected)
+            .expect("send authenticated message");
+
+        let received = receiver_thread
+            .join()
+            .expect("receiver thread must not panic");
+        assert_eq!(received, expected);
+    }
+
+    #[cfg(feature = "rustcrypto-auth")]
+    #[test]
+    fn local_builder_shared_secret_mismatch_fails_bootstrap() {
+        let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let _runtime_guard = local::stable_test_runtime_dir_guard("shared-secret-mismatch", id);
+        let channel_id = test_channel_id("builder-shared-secret-mismatch", id);
+        let receiver_channel_id = channel_id.clone();
+        let receiver_thread = thread::spawn(move || {
+            Builder::receiver(
+                receiver_channel_id,
+                ProcessLocation::new("node-0").expect("receiver location"),
+                ProcessLocation::new("node-0").expect("sender location"),
+            )
+            .with_shared_secret(b"receiver secret".to_vec())
+            .build_with_timeout(Duration::from_secs(2))
+        });
+
+        let sender_err = Builder::sender(
+            channel_id,
+            ProcessLocation::new("node-0").expect("sender location"),
+            ProcessLocation::new("node-0").expect("receiver location"),
+        )
+        .with_shared_secret(b"sender secret".to_vec())
+        .build_with_timeout(Duration::from_secs(2))
+        .expect_err("sender auth must fail");
+        let receiver_err = receiver_thread
+            .join()
+            .expect("receiver thread must not panic")
+            .expect_err("receiver auth must fail");
+
+        assert!(matches!(
+            sender_err,
+            LavaFlowError::ChannelAuthenticationFailed { .. }
+                | LavaFlowError::ChannelDisconnected
+                | LavaFlowError::ChannelTransportOperation { .. }
+        ));
+        assert!(matches!(
+            receiver_err,
+            LavaFlowError::ChannelAuthenticationFailed { .. } | LavaFlowError::ChannelDisconnected
+        ));
+    }
+
+    #[cfg(feature = "rustcrypto-auth")]
+    #[test]
+    fn local_builder_shared_secret_presence_mismatch_fails_bootstrap() {
+        let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let _runtime_guard = local::stable_test_runtime_dir_guard("shared-secret-presence", id);
+        let channel_id = test_channel_id("builder-shared-secret-presence", id);
+        let receiver_channel_id = channel_id.clone();
+        let receiver_thread = thread::spawn(move || {
+            Builder::receiver(
+                receiver_channel_id,
+                ProcessLocation::new("node-0").expect("receiver location"),
+                ProcessLocation::new("node-0").expect("sender location"),
+            )
+            .with_shared_secret(b"receiver secret".to_vec())
+            .build_with_timeout(Duration::from_secs(2))
+        });
+
+        let sender_err = Builder::sender(
+            channel_id,
+            ProcessLocation::new("node-0").expect("sender location"),
+            ProcessLocation::new("node-0").expect("receiver location"),
+        )
+        .build_with_timeout(Duration::from_secs(2))
+        .expect_err("sender auth mode mismatch must fail");
+        let receiver_err = receiver_thread
+            .join()
+            .expect("receiver thread must not panic")
+            .expect_err("receiver auth mode mismatch must fail");
+
+        assert!(matches!(
+            sender_err,
+            LavaFlowError::ChannelAuthenticationFailed { .. }
+                | LavaFlowError::ChannelDisconnected
+                | LavaFlowError::ChannelTransportOperation { .. }
+        ));
+        assert!(matches!(
+            receiver_err,
+            LavaFlowError::ChannelAuthenticationFailed { .. } | LavaFlowError::ChannelDisconnected
+        ));
+    }
+
+    #[cfg(not(feature = "rustcrypto-auth"))]
+    #[test]
+    fn local_builder_shared_secret_reports_unsupported_when_auth_feature_is_disabled() {
+        let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let _runtime_guard = local::stable_test_runtime_dir_guard("shared-secret-disabled", id);
+        let channel_id = test_channel_id("builder-shared-secret-disabled", id);
+        let receiver_channel_id = channel_id.clone();
+        let receiver_thread = thread::spawn(move || {
+            Builder::receiver(
+                receiver_channel_id,
+                ProcessLocation::new("node-0").expect("receiver location"),
+                ProcessLocation::new("node-0").expect("sender location"),
+            )
+            .with_shared_secret(b"shared secret".to_vec())
+            .build_with_timeout(Duration::from_secs(2))
+        });
+
+        let sender_err = Builder::sender(
+            channel_id,
+            ProcessLocation::new("node-0").expect("sender location"),
+            ProcessLocation::new("node-0").expect("receiver location"),
+        )
+        .with_shared_secret(b"shared secret".to_vec())
+        .build_with_timeout(Duration::from_secs(2))
+        .expect_err("sender auth must report unsupported auth");
+        let receiver_err = receiver_thread
+            .join()
+            .expect("receiver thread must not panic")
+            .expect_err("receiver auth must report unsupported auth");
+
+        assert!(matches!(
+            sender_err,
+            LavaFlowError::UnsupportedChannelAuthentication {
+                mechanism: "shared-secret-hmac-sha256"
+            } | LavaFlowError::ChannelAuthenticationFailed { .. }
+                | LavaFlowError::ChannelDisconnected
+        ));
+        assert!(matches!(
+            receiver_err,
+            LavaFlowError::UnsupportedChannelAuthentication {
+                mechanism: "shared-secret-hmac-sha256"
+            } | LavaFlowError::ChannelDisconnected
+        ));
+    }
+
+    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
+    #[test]
+    fn local_builder_expected_peer_process_id_round_trips() {
+        let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let _runtime_guard = local::stable_test_runtime_dir_guard("peer-pid-ok", id);
+        let channel_id = test_channel_id("builder-peer-pid-ok", id);
+        let receiver_channel_id = channel_id.clone();
+        let expected_pid = std::process::id();
+        let receiver_thread = thread::spawn(move || {
+            let mut receiver = Builder::receiver(
+                receiver_channel_id,
+                ProcessLocation::new("node-0").expect("receiver location"),
+                ProcessLocation::new("node-0").expect("sender location"),
+            )
+            .with_expected_peer_process_id(expected_pid)
+            .build_with_timeout(Duration::from_secs(2))
+            .expect("build receiver with expected peer pid");
+            let (frame, metadata) = receiver.recv_map().expect("receive message");
+            assert!(matches!(frame, Frame::Cpu(_)));
+            metadata
+        });
+
+        let mut sender = Builder::sender(
+            channel_id,
+            ProcessLocation::new("node-0").expect("sender location"),
+            ProcessLocation::new("node-0").expect("receiver location"),
+        )
+        .with_expected_peer_process_id(expected_pid)
+        .build_with_timeout(Duration::from_secs(2))
+        .expect("build sender with expected peer pid");
+        let metadata = MessageMeta {
+            values: BTreeMap::from([("peer-pid".into(), MetaValue::U64(expected_pid as u64))]),
+        };
+        let buffer = cpu::Allocator::with_max_allocation_size(usize::MAX)
+            .allocate(64)
+            .expect("allocate payload");
+        sender
+            .send_map(buffer, metadata.clone())
+            .expect("send message");
+
+        let received = receiver_thread
+            .join()
+            .expect("receiver thread must not panic");
+        assert_eq!(received, metadata);
+    }
+
+    #[cfg(all(
+        feature = "rustcrypto-auth",
+        any(windows, target_os = "linux", target_os = "android")
+    ))]
+    #[test]
+    fn local_builder_shared_secret_and_peer_process_id_round_trip() {
+        let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let _runtime_guard = local::stable_test_runtime_dir_guard("secret-peer-pid-ok", id);
+        let channel_id = test_channel_id("builder-secret-peer-pid-ok", id);
+        let receiver_channel_id = channel_id.clone();
+        let expected_pid = std::process::id();
+        let secret = b"shared local ipc defense in depth secret".to_vec();
+        let receiver_secret = secret.clone();
+        let expected = MessageMeta {
+            values: BTreeMap::from([("defense-in-depth".into(), MetaValue::Bool(true))]),
+        };
+        let receiver_thread = thread::spawn(move || {
+            let mut receiver = Builder::receiver(
+                receiver_channel_id,
+                ProcessLocation::new("node-0").expect("receiver location"),
+                ProcessLocation::new("node-0").expect("sender location"),
+            )
+            .with_shared_secret(receiver_secret)
+            .with_expected_peer_process_id(expected_pid)
+            .build_with_timeout(Duration::from_secs(2))
+            .expect("build receiver with shared secret and peer pid");
+            let (frame, metadata) = receiver.recv_map().expect("receive message");
+            assert!(matches!(frame, Frame::Cpu(_)));
+            metadata
+        });
+
+        let mut sender = Builder::sender(
+            channel_id,
+            ProcessLocation::new("node-0").expect("sender location"),
+            ProcessLocation::new("node-0").expect("receiver location"),
+        )
+        .with_shared_secret(secret)
+        .with_expected_peer_process_id(expected_pid)
+        .build_with_timeout(Duration::from_secs(2))
+        .expect("build sender with shared secret and peer pid");
+        let buffer = cpu::Allocator::with_max_allocation_size(usize::MAX)
+            .allocate(64)
+            .expect("allocate payload");
+        sender
+            .send_map(buffer, expected.clone())
+            .expect("send message");
+
+        let received = receiver_thread
+            .join()
+            .expect("receiver thread must not panic");
+        assert_eq!(received, expected);
+    }
+
+    #[cfg(all(
+        feature = "rustcrypto-auth",
+        any(windows, target_os = "linux", target_os = "android")
+    ))]
+    #[test]
+    fn local_builder_shared_secret_does_not_bypass_peer_process_id_mismatch() {
+        let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let _runtime_guard = local::stable_test_runtime_dir_guard("secret-peer-pid-mismatch", id);
+        let channel_id = test_channel_id("builder-secret-peer-pid-mismatch", id);
+        let receiver_channel_id = channel_id.clone();
+        let actual_pid = std::process::id();
+        let wrong_pid = if actual_pid == u32::MAX {
+            1
+        } else {
+            actual_pid + 1
+        };
+        let secret = b"shared local ipc defense in depth secret".to_vec();
+        let receiver_secret = secret.clone();
+        let receiver_thread = thread::spawn(move || {
+            Builder::receiver(
+                receiver_channel_id,
+                ProcessLocation::new("node-0").expect("receiver location"),
+                ProcessLocation::new("node-0").expect("sender location"),
+            )
+            .with_shared_secret(receiver_secret)
+            .with_expected_peer_process_id(wrong_pid)
+            .build_with_timeout(Duration::from_secs(2))
+        });
+
+        let sender_err = Builder::sender(
+            channel_id,
+            ProcessLocation::new("node-0").expect("sender location"),
+            ProcessLocation::new("node-0").expect("receiver location"),
+        )
+        .with_shared_secret(secret)
+        .with_expected_peer_process_id(actual_pid)
+        .build_with_timeout(Duration::from_secs(2))
+        .expect_err("sender must fail when receiver rejects peer pid");
+        let receiver_err = receiver_thread
+            .join()
+            .expect("receiver thread must not panic")
+            .expect_err("receiver must reject wrong peer pid");
+
+        assert!(matches!(
+            sender_err,
+            LavaFlowError::ChannelAuthenticationFailed { .. }
+                | LavaFlowError::ChannelDisconnected
+                | LavaFlowError::ChannelTransportOperation { .. }
+        ));
+        assert!(matches!(
+            receiver_err,
+            LavaFlowError::ChannelAuthenticationFailed { .. }
+                | LavaFlowError::ChannelDisconnected
+                | LavaFlowError::ChannelTransportOperation { .. }
+        ));
+    }
+
     #[test]
     fn local_builder_public_gpu_send_and_recv_round_trip() {
         let allocator = match gpu::Allocator::new() {
@@ -813,8 +1206,7 @@ mod tests {
         };
         let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let _runtime_guard = local::stable_test_runtime_dir_guard("public-gpu", id);
-        let channel_id =
-            ChannelId::new(format!("builder-local-gpu-round-trip-{id}")).expect("channel id");
+        let channel_id = test_channel_id("builder-local-gpu-round-trip", id);
         let receiver_channel_id = channel_id.clone();
         let expected = PublicTestMeta {
             width: 320,
@@ -856,7 +1248,7 @@ mod tests {
     fn local_builder_sender_limit_override_rejects_oversized_payload() {
         let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let _runtime_guard = local::stable_test_runtime_dir_guard("limits", id);
-        let channel_id = ChannelId::new(format!("builder-local-limits-{id}")).expect("channel id");
+        let channel_id = test_channel_id("builder-local-limits", id);
         let receiver_channel_id = channel_id.clone();
         let receiver_thread =
             thread::spawn(move || build_local_receiver_with_timeout(receiver_channel_id, 8));
@@ -866,7 +1258,7 @@ mod tests {
             ProcessLocation::new("node-0").expect("sender location"),
             ProcessLocation::new("node-0").expect("receiver location"),
         )
-        .with_local_max_payload_size(8)
+        .with_max_payload_size(8)
         .build()
         .expect("build sender");
         let _receiver = receiver_thread
@@ -895,8 +1287,7 @@ mod tests {
     fn local_builder_metadata_limit_override_rejects_oversized_metadata() {
         let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let _runtime_guard = local::stable_test_runtime_dir_guard("metadata-limits", id);
-        let channel_id =
-            ChannelId::new(format!("builder-local-metadata-limits-{id}")).expect("channel id");
+        let channel_id = test_channel_id("builder-local-metadata-limits", id);
         let receiver_channel_id = channel_id.clone();
         let receiver_thread =
             thread::spawn(move || build_local_receiver_with_limits(receiver_channel_id, 0, 8));
@@ -906,7 +1297,7 @@ mod tests {
             ProcessLocation::new("node-0").expect("sender location"),
             ProcessLocation::new("node-0").expect("receiver location"),
         )
-        .with_local_max_metadata_size(8)
+        .with_max_metadata_size(8)
         .build()
         .expect("build sender");
         let _receiver = receiver_thread
@@ -935,8 +1326,7 @@ mod tests {
     fn local_sender_and_receiver_builders_use_hostname_defaults() {
         let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let _runtime_guard = local::stable_test_runtime_dir_guard("hostname-defaults", id);
-        let channel_id =
-            ChannelId::new(format!("builder-local-hostname-defaults-{id}")).expect("channel id");
+        let channel_id = test_channel_id("builder-local-hostname-defaults", id);
         let receiver_channel_id = channel_id.clone();
         let receiver_thread = thread::spawn(move || {
             let mut receiver = build_local_receiver_with_hostname_timeout(receiver_channel_id);
@@ -969,8 +1359,7 @@ mod tests {
     #[test]
     fn local_builder_authenticated_users_access_round_trips_dynamic_metadata() {
         let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let channel_id =
-            ChannelId::new(format!("builder-authenticated-users-{id}")).expect("channel id");
+        let channel_id = test_channel_id("builder-authenticated-users", id);
         let receiver_channel_id = channel_id.clone();
         let receiver_thread = thread::spawn(move || {
             let mut receiver = Builder::receiver(
@@ -1014,7 +1403,7 @@ mod tests {
     fn local_builder_mixed_access_policies_do_not_rendezvous() {
         let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let _runtime_guard = local::stable_test_runtime_dir_guard("mixed-access", id);
-        let channel_id = ChannelId::new(format!("builder-mixed-access-{id}")).expect("channel id");
+        let channel_id = test_channel_id("builder-mixed-access", id);
         let sender_channel_id = channel_id.clone();
         let sender_thread = thread::spawn(move || {
             Builder::sender(
@@ -1054,8 +1443,7 @@ mod tests {
     fn receiver_builder_build_with_timeout_reports_connect_timeout() {
         let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let _runtime_guard = local::stable_test_runtime_dir_guard("connect-timeout", id);
-        let channel_id =
-            ChannelId::new(format!("builder-receiver-timeout-{id}")).expect("channel id");
+        let channel_id = test_channel_id("builder-receiver-timeout", id);
         let err = Builder::receiver(
             channel_id,
             ProcessLocation::new("node-0").expect("receiver location"),
@@ -1075,8 +1463,7 @@ mod tests {
     fn sender_builder_build_with_timeout_reports_accept_timeout() {
         let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let _runtime_guard = local::stable_test_runtime_dir_guard("sender-accept-timeout", id);
-        let channel_id =
-            ChannelId::new(format!("builder-sender-timeout-{id}")).expect("channel id");
+        let channel_id = test_channel_id("builder-sender-timeout", id);
         let err = Builder::sender(
             channel_id,
             ProcessLocation::new("node-0").expect("sender location"),
@@ -1096,7 +1483,7 @@ mod tests {
     fn sender_builder_build_or_cancelled_reports_cancellation() {
         let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let _runtime_guard = local::stable_test_runtime_dir_guard("sender-cancel", id);
-        let channel_id = ChannelId::new(format!("builder-sender-cancel-{id}")).expect("channel id");
+        let channel_id = test_channel_id("builder-sender-cancel", id);
         let cancel = BuildCancel::new();
         let build_cancel = cancel.clone();
         let builder = Builder::sender(
@@ -1124,8 +1511,7 @@ mod tests {
     fn receiver_builder_build_or_cancelled_reports_cancellation() {
         let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let _runtime_guard = local::stable_test_runtime_dir_guard("receiver-cancel", id);
-        let channel_id =
-            ChannelId::new(format!("builder-receiver-cancel-{id}")).expect("channel id");
+        let channel_id = test_channel_id("builder-receiver-cancel", id);
         let cancel = BuildCancel::new();
         let build_cancel = cancel.clone();
         let builder = Builder::receiver(
@@ -1155,8 +1541,7 @@ mod tests {
     fn receiver_builder_build_with_timeout_allows_delayed_sender_startup() {
         let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let _runtime_guard = local::stable_test_runtime_dir_guard("delayed-startup", id);
-        let channel_id =
-            ChannelId::new(format!("builder-receiver-timeout-startup-{id}")).expect("channel id");
+        let channel_id = test_channel_id("builder-receiver-timeout-startup", id);
         let receiver_channel_id = channel_id.clone();
         let receiver_thread = thread::spawn(move || {
             let mut receiver = Builder::receiver(
@@ -1200,7 +1585,7 @@ mod tests {
     fn receiver_builder_build_with_timeout_or_cancel_allows_delayed_sender_startup() {
         let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let _runtime_guard = local::stable_test_runtime_dir_guard("rx-combo-ok", id);
-        let channel_id = ChannelId::new(format!("rx-combo-{id}")).expect("channel id");
+        let channel_id = test_channel_id("rx-combo", id);
         let receiver_channel_id = channel_id.clone();
         let receiver_thread = thread::spawn(move || {
             let mut receiver = Builder::receiver(
@@ -1243,7 +1628,7 @@ mod tests {
     fn sender_builder_build_with_timeout_or_cancel_allows_delayed_receiver_startup() {
         let id = CHANNEL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let _runtime_guard = local::stable_test_runtime_dir_guard("tx-combo-ok", id);
-        let channel_id = ChannelId::new(format!("tx-combo-{id}")).expect("channel id");
+        let channel_id = test_channel_id("tx-combo", id);
         let sender_channel_id = channel_id.clone();
         let expected = MessageMeta {
             values: BTreeMap::from([("sender-combined".into(), MetaValue::Bool(true))]),
